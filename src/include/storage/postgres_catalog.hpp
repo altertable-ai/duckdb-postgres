@@ -33,6 +33,7 @@ public:
 	string attach_path;
 	AccessMode access_mode;
 	PostgresIsolationLevel isolation_level;
+	PostgresUseCtidScan use_ctid_scan = PostgresUseCtidScan::DEFAULT;
 
 public:
 	void Initialize(bool load_builtin) override;

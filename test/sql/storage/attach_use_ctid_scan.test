@@ -1,0 +1,73 @@
+# name: test/sql/storage/attach_use_ctid_scan.test
+# description: Test the per-attach use_ctid_scan option overriding the global pg_use_ctid_scan setting
+# group: [storage]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+statement ok
+PRAGMA enable_verification
+
+# per-attach option disables ctid scan even though the global setting defaults to true
+statement ok
+SET pg_use_ctid_scan=true;
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES, USE_CTID_SCAN false)
+
+query I
+SELECT * FROM s.pg_giant_numeric
+----
+0.0
+1.0000000000000002e+32
+-1.234567891234568e+26
+
+statement ok
+DETACH s
+
+# per-attach option enables ctid scan even though the global setting is false (override works both ways)
+statement ok
+SET pg_use_ctid_scan=false;
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES, USE_CTID_SCAN true)
+
+query I
+SELECT * FROM s.pg_giant_numeric
+----
+0.0
+1.0000000000000002e+32
+-1.234567891234568e+26
+
+statement ok
+DETACH s
+
+# when omitted, behavior follows the global setting (here: false) and still produces correct results
+statement ok
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES)
+
+query I
+SELECT * FROM s.pg_giant_numeric
+----
+0.0
+1.0000000000000002e+32
+-1.234567891234568e+26
+
+statement ok
+DETACH s
+
+statement ok
+SET pg_use_ctid_scan=true;
+
+# boolean-typed values are accepted
+statement ok
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES, USE_CTID_SCAN 1)
+
+statement ok
+DETACH s
+
+# a non-boolean value raises a clear error
+statement error
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES, USE_CTID_SCAN 'not_a_bool')
+----

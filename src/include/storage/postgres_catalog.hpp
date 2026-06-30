@@ -43,6 +43,7 @@ public:
 	AccessMode access_mode;
 	PostgresIsolationLevel isolation_level;
 	PostgresTextProtocolMode text_protocol_mode;
+	PostgresUseCtidScan use_ctid_scan = PostgresUseCtidScan::DEFAULT;
 
 public:
 	void Initialize(bool load_builtin) override;

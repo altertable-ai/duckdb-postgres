@@ -74,6 +74,8 @@ enum class PostgresIsolationLevel { READ_COMMITTED, REPEATABLE_READ, SERIALIZABL
 
 enum class PostgresConnectCheck { THROW_ON_CONNECTION_BAD, RETURN_ON_CONNECTION_BAD };
 
+enum class PostgresUseCtidScan : uint8_t { DEFAULT, ENABLED, DISABLED };
+
 class PostgresUtils {
 public:
 	static PGconn *PGConnect(const string &dsn, const string &attach_path);

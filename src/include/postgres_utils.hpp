@@ -57,6 +57,8 @@ struct PostgresCopyState {
 
 enum class PostgresIsolationLevel { READ_COMMITTED, REPEATABLE_READ, SERIALIZABLE };
 
+enum class PostgresUseCtidScan : uint8_t { DEFAULT, ENABLED, DISABLED };
+
 class PostgresUtils {
 public:
 	static PGconn *PGConnect(const string &dsn, const string &attach_path);

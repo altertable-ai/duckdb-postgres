@@ -121,6 +121,10 @@ void PostgresScanFunction::PrepareBind(PostgresVersion version, ClientContext &c
 	if (context.TryGetCurrentSetting("pg_use_ctid_scan", pg_use_ctid_scan)) {
 		use_ctid_scan = BooleanValue::Get(pg_use_ctid_scan);
 	}
+	auto pg_catalog = bind_data.GetCatalog();
+	if (pg_catalog && pg_catalog->use_ctid_scan != PostgresUseCtidScan::DEFAULT) {
+		use_ctid_scan = pg_catalog->use_ctid_scan == PostgresUseCtidScan::ENABLED;
+	}
 	if (bind_data.use_text_protocol) {
 		// ctid scan is only supported for binary copy
 		use_ctid_scan = false;

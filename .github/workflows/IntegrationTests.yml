@@ -129,8 +129,8 @@ jobs:
     strategy:
       matrix:
         postgres:
-        - name: pg-14
-          version: 14
+        - name: pg-15
+          version: 15
         - name: pg-18
           version: 18
 

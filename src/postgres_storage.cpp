@@ -164,10 +164,9 @@ static unique_ptr<Catalog> PostgresAttach(optional_ptr<StorageExtensionInfo> sto
 	}
 	SecretStorageTable secret_storage_table(std::move(secret_storage_table_name),
 	                                        secret_storage_table_specified_explicitly);
-	auto catalog = make_uniq<PostgresCatalog>(context, db, std::move(attach_path), attach_options.access_mode,
-	                                          std::move(schemas_to_load), isolation_level, secret_name,
-	                                          std::move(secret_storage_table), text_protocol_mode,
-	                                          std::move(connect_display));
+	auto catalog = make_uniq<PostgresCatalog>(
+	    context, db, std::move(attach_path), attach_options.access_mode, std::move(schemas_to_load), isolation_level,
+	    secret_name, std::move(secret_storage_table), text_protocol_mode, std::move(connect_display));
 	catalog->use_ctid_scan = use_ctid_scan;
 	return catalog;
 }

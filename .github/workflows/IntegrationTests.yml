@@ -98,7 +98,7 @@ jobs:
         key: ${{ steps.cache_key.outputs.value }}
 
     - name: Setup Postgres
-      uses: ikalnytskyi/action-setup-postgres@v8
+      uses: ikalnytskyi/action-setup-postgres@v9
       with:
         postgres-version: 17
         username: 'postgres'
@@ -184,7 +184,7 @@ jobs:
         make release
 
     - name: Setup Postgres
-      uses: ikalnytskyi/action-setup-postgres@v8
+      uses: ikalnytskyi/action-setup-postgres@v9
       with:
         postgres-version: ${{ matrix.postgres.version }}
         username: 'postgres'
@@ -329,7 +329,7 @@ jobs:
         key: ${{ steps.cache_key.outputs.value }}
 
     - name: Setup Postgres
-      uses: ikalnytskyi/action-setup-postgres@v8
+      uses: ikalnytskyi/action-setup-postgres@v9
       with:
         postgres-version: 17
         username: 'postgres'
@@ -445,7 +445,7 @@ jobs:
         key: ${{ steps.cache_key.outputs.value }}
 
     - name: Setup Postgres
-      uses: ikalnytskyi/action-setup-postgres@v8
+      uses: ikalnytskyi/action-setup-postgres@v9
       with:
         postgres-version: '17'
         username: 'postgres'

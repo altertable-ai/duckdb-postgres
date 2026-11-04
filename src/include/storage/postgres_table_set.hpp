@@ -19,6 +19,9 @@ class PostgresConnection;
 class PostgresResult;
 class PostgresSchemaEntry;
 
+//! The CREATE TABLE statement for a (bound) table definition
+string GetPostgresCreateTable(CreateTableInfo &info);
+
 class PostgresTableSet : public PostgresInSchemaSet {
 public:
 	explicit PostgresTableSet(PostgresSchemaEntry &schema, unique_ptr<PostgresResultSlice> tables = nullptr);
@@ -34,8 +37,9 @@ public:
 
 	void AlterTable(ClientContext &context, PostgresTransaction &transaction, AlterTableInfo &info);
 
-	static string GetInitializeQuery(const string &schema = string(), const string &table = string());
-	static string GetInitializeQuery(const vector<string> &schemas, const string &table = string());
+	static string GetInitializeQuery(PostgresVersion version, const string &schema, const string &table = string());
+	static string GetInitializeQuery(PostgresVersion version, const vector<string> &schemas,
+	                                 const string &table = string());
 	static string GetInitializeQueryInformationSchema(const string &schema = string(), const string &table = string());
 	static string GetInitializeQueryInformationSchema(const vector<string> &schemas, const string &table = string());
 

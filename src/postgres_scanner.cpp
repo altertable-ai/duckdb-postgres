@@ -34,11 +34,18 @@ struct PostgresLocalState : public LocalTableFunctionState {
 	vector<column_t> column_ids;
 	TableFilterSet *filters;
 	string col_names;
-	PostgresConnection connection;
+	//! Whether this scan reads using the text protocol (see PostgresBindData::text_protocol_fallback)
+	bool use_text_protocol = false;
+	//! Connection owned by the global state (pinned or transaction connection), if this thread uses it
+	optional_ptr<PostgresConnection> global_connection;
+	//! Pool connection ID of global_connection
+	uint64_t global_connection_id = 0;
 	idx_t batch_idx = 0;
+	//! Connection of this thread, used when global_connection is not set
 	PostgresPoolConnection pool_connection;
 	unique_ptr<PostgresResultReader> reader;
 
+	PostgresConnection &GetConnection();
 	void ScanChunk(ClientContext &context, const PostgresBindData &bind_data, PostgresGlobalState &gstate,
 	               DataChunk &output);
 };
@@ -58,11 +65,12 @@ struct PostgresGlobalState : public GlobalTableFunctionState {
 	bool used_main_thread = false;
 	string snapshot;
 
-	PostgresConnection &GetConnection();
-	void SetConnection(PostgresConnection connection);
-	void SetConnection(shared_ptr<OwnedPostgresConnection> connection);
-	void SetPinnedConnection(PostgresPoolConnection pinned_connection,
-	                         dbconnector::attached::AttachedCatalog attached_catalog);
+	//! Returns the pinned connection if there is one, otherwise the connection of the current transaction
+	PostgresConnection &GetConnection(ClientContext &context);
+	//! Returns the pool connection ID of the connection returned by GetConnection
+	uint64_t GetConnectionId(ClientContext &context);
+	void SetConnectionSource(dbconnector::attached::AttachedCatalog attached_catalog, bool use_transaction,
+	                         PostgresPoolConnection pinned_connection);
 
 	bool TryOpenNewConnection(ClientContext &context, PostgresLocalState &lstate, const PostgresBindData &bind_data);
 	idx_t MaxThreads() const override {
@@ -70,9 +78,9 @@ struct PostgresGlobalState : public GlobalTableFunctionState {
 	}
 
 private:
-	PostgresConnection connection;
-	PostgresPoolConnection pinned_connection;
 	dbconnector::attached::AttachedCatalog attached_catalog;
+	bool use_transaction = true;
+	PostgresPoolConnection pinned_connection;
 };
 
 static void PostgresGetSnapshot(ClientContext &context, const PostgresBindData &bind_data,
@@ -90,7 +98,7 @@ static void PostgresGetSnapshot(ClientContext &context, const PostgresBindData &
 		return;
 	}
 	// reader threads can use the same snapshot
-	auto &con = gstate.GetConnection();
+	auto &con = gstate.GetConnection(context);
 	// snapshot export works on replicas since PostgreSQL 10 and on RDS/Aurora, so no recovery check is needed
 	auto result = con.TryQuery(context, "SELECT pg_export_snapshot()");
 	if (result) {
@@ -102,7 +110,15 @@ void PostgresScanFunction::PrepareBind(PostgresVersion version, ClientContext &c
                                        int64_t approx_num_pages, optional_ptr<PostgresCatalog> pg_catalog) {
 	// resolve the protocol before any decision that depends on it (ctid scan, max threads)
 	// note that bind_data.use_text_protocol holds the value of the pg_use_text_protocol setting here
-	if (pg_catalog) {
+	bind_data.instance_type = version.type_v;
+	if (pg_catalog &&
+	    pg_catalog->UseBinaryPlainQueryWithTextFallback(bind_data.query_mode, bind_data.use_text_protocol)) {
+		// Redshift does not support the binary COPY protocol, but plain query results in the binary format are
+		// faster to transfer than the text ones
+		bind_data.query_mode = PostgresQueryMode::PLAIN_QUERY_BINARY;
+		bind_data.use_text_protocol = false;
+		bind_data.text_protocol_fallback = true;
+	} else if (pg_catalog) {
 		// for an attached database the mode set at ATTACH time decides
 		bind_data.use_text_protocol = pg_catalog->UseTextProtocol(bind_data.query_mode, bind_data.use_text_protocol);
 	} else if (version.type_v == PostgresInstanceType::REDSHIFT) {
@@ -163,16 +179,31 @@ void PostgresBindData::SetTablePages(idx_t approx_num_pages) {
 	}
 }
 
-PostgresConnection &PostgresGlobalState::GetConnection() {
-	return connection;
+uint64_t PostgresGlobalState::GetConnectionId(ClientContext &context) {
+	if (pinned_connection) {
+		return pinned_connection.Id();
+	}
+	PostgresCatalog &catalog = attached_catalog.Get<PostgresCatalog>();
+	return PostgresTransaction::Get(context, catalog).GetPoolConnectionId();
 }
 
-void PostgresGlobalState::SetConnection(PostgresConnection connection) {
-	this->connection = std::move(connection);
+PostgresConnection &PostgresGlobalState::GetConnection(ClientContext &context) {
+	if (pinned_connection) {
+		return pinned_connection.GetConnection();
+	}
+	PostgresCatalog &catalog = attached_catalog.Get<PostgresCatalog>();
+	auto &transaction = PostgresTransaction::Get(context, catalog);
+	if (use_transaction) {
+		return transaction.GetConnection();
+	}
+	return transaction.GetConnectionWithoutTransaction();
 }
 
-void PostgresGlobalState::SetConnection(shared_ptr<OwnedPostgresConnection> connection) {
-	this->connection = PostgresConnection(std::move(connection));
+void PostgresGlobalState::SetConnectionSource(dbconnector::attached::AttachedCatalog attached_catalog,
+                                              bool use_transaction, PostgresPoolConnection pinned_connection) {
+	this->attached_catalog = std::move(attached_catalog);
+	this->use_transaction = use_transaction;
+	this->pinned_connection = std::move(pinned_connection);
 }
 
 static unique_ptr<FunctionData> PostgresBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &,
@@ -192,11 +223,26 @@ static bool ContainsCastToVarchar(const PostgresType &type) {
 	return false;
 }
 
+static bool RequiresTextProtocol(const PostgresBindData &bind_data, const vector<column_t> &column_ids) {
+	for (auto column_id : column_ids) {
+		if (column_id < bind_data.postgres_types.size() &&
+		    bind_data.postgres_types[column_id].info == PostgresTypeAnnotation::TEXT_PROTOCOL_ONLY) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static string WriteColumnNames(const PostgresBindData &bind_data, const PostgresLocalState &lstate,
                                bool &col_names_required) {
 	string col_names;
 	col_names_required = bind_data.names.size() != lstate.column_ids.size();
-	for (auto &column_id : lstate.column_ids) {
+	for (idx_t i = 0; i < lstate.column_ids.size(); i++) {
+		auto column_id = lstate.column_ids[i];
+		if (column_id != i) {
+			// the projection reorders the columns, the readers decode them in the projected order
+			col_names_required = true;
+		}
 		if (!col_names.empty()) {
 			col_names += ", ";
 		}
@@ -210,6 +256,12 @@ static string WriteColumnNames(const PostgresBindData &bind_data, const Postgres
 			col_names_required = true;
 		} else {
 			col_names += PostgresUtils::WriteIdentifier(bind_data.names[column_id]);
+			if (bind_data.postgres_types[column_id].info == PostgresTypeAnnotation::TEXT_PROTOCOL_ONLY &&
+			    !lstate.use_text_protocol) {
+				throw NotImplementedException("Error reading table \"%s\" - column \"%s\" can only be read using the "
+				                              "text protocol, use pg_query_mode = 'PLAIN_QUERY_TEXT'",
+				                              bind_data.table_name, bind_data.names[column_id]);
+			}
 			if (bind_data.postgres_types[column_id].info == PostgresTypeAnnotation::CAST_TO_VARCHAR) {
 				col_names += "::VARCHAR";
 				col_names_required = true;
@@ -239,11 +291,14 @@ static void PostgresInitInternal(ClientContext &context, const PostgresBindData 
 	D_ASSERT(bind_data_p);
 	D_ASSERT(task_min <= task_max);
 
-	auto bind_data = bind_data_p->Cast<PostgresBindData>();
+	auto &bind_data = bind_data_p->Cast<PostgresBindData>();
 
+	lstate.use_text_protocol = bind_data.use_text_protocol ||
+	                           (bind_data.text_protocol_fallback && RequiresTextProtocol(bind_data, lstate.column_ids));
 	bool col_names_required = false;
 	string col_names = WriteColumnNames(bind_data, lstate, col_names_required);
-	string filter_string = PostgresFilterPushdown::TransformFilters(lstate.column_ids, lstate.filters, bind_data.names);
+	string filter_string = PostgresFilterPushdown::TransformFilters(lstate.column_ids, lstate.filters, bind_data.names,
+	                                                                bind_data.instance_type);
 
 	string filter;
 
@@ -280,7 +335,7 @@ static void PostgresInitInternal(ClientContext &context, const PostgresBindData 
 	if (!bind_data.limit_clause.empty()) {
 		query += bind_data.limit_clause;
 	}
-	if (!(bind_data.use_text_protocol || bind_data.query_mode == PostgresQueryMode::PLAIN_QUERY_BINARY)) {
+	if (!(lstate.use_text_protocol || bind_data.query_mode == PostgresQueryMode::PLAIN_QUERY_BINARY)) {
 		query = StringUtil::Format("COPY (%s) TO STDOUT (FORMAT \"binary\");", query);
 	}
 	lstate.sql = std::move(query);
@@ -316,6 +371,15 @@ static void PostgresScanConnect(ClientContext &context, PostgresConnection &conn
 	}
 }
 
+static void HandleCatalogCache(ClientContext &context, const PostgresBindData &bind_data) {
+	if (!bind_data.clear_catalog_cache || bind_data.pinned_connection_id > 0) {
+		return;
+	}
+	auto attached_catalog = PostgresCatalog::Lookup(context, bind_data.catalog_name);
+	PostgresCatalog &catalog = attached_catalog.Get<PostgresCatalog>();
+	catalog.ClearCache();
+}
+
 static unique_ptr<GlobalTableFunctionState> PostgresInitGlobalState(ClientContext &context,
                                                                     TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<PostgresBindData>();
@@ -326,26 +390,24 @@ static unique_ptr<GlobalTableFunctionState> PostgresInitGlobalState(ClientContex
 	attached_catalog = PostgresCatalog::Lookup(context, bind_data.catalog_name);
 	pg_catalog = &attached_catalog.Get<PostgresCatalog>();
 
-	optional_ptr<PostgresConnection> con_ptr = nullptr;
 	PostgresPoolConnection pinned_connection;
-
 	if (bind_data.pinned_connection_id > 0) {
 		pinned_connection = pg_catalog->GetConnectionPool().UnpinConnection(bind_data.pinned_connection_id);
-		PostgresConnection &conn = pinned_connection.GetConnection();
-		con_ptr = &conn;
-	} else {
-		auto &transaction = Transaction::Get(context, *pg_catalog).Cast<PostgresTransaction>();
-		if (bind_data.use_transaction) {
-			con_ptr = &transaction.GetConnection();
-		} else {
-			con_ptr = &transaction.GetConnectionWithoutTransaction();
-		}
 	}
-	PostgresConnection &con = *con_ptr;
+	result->SetConnectionSource(std::move(attached_catalog), bind_data.use_transaction, std::move(pinned_connection));
+	PostgresConnection &con = result->GetConnection(context);
 
-	result->SetConnection(con.GetConnection());
-	if (pinned_connection) {
-		result->SetPinnedConnection(std::move(pinned_connection), std::move(attached_catalog));
+	// the statement prepared in bind is only offered to the reader that uses the global connection, close it if
+	// there is no such reader. If it was prepared on another connection, that session is already gone.
+	auto &prepared_statement = bind_data.prepared_statement;
+	if (prepared_statement && !prepared_statement->IsDestroyed() &&
+	    prepared_statement->GetPoolConnectionId() == result->GetConnectionId(context) &&
+	    (bind_data.command_only || !bind_data.can_use_main_thread)) {
+		prepared_statement->Destroy(con);
+	}
+
+	for (const string &query : bind_data.preliminary_queries) {
+		con.Execute(context, query);
 	}
 
 	if (bind_data.command_only) {
@@ -353,7 +415,8 @@ static unique_ptr<GlobalTableFunctionState> PostgresInitGlobalState(ClientContex
 		// fire it — and hand back a rowcount result through the materialized-collection
 		// fast path (PostgresScan returns gstate.collection directly, and GetLocalState short-circuits
 		// when a collection is present, so no postgres scan connection is opened).
-		unique_ptr<PostgresResult> pg_res = con.Query(context, bind_data.sql);
+		unique_ptr<PostgresResult> pg_res = con.Query(context, bind_data.sql, bind_data.params);
+		HandleCatalogCache(context, bind_data);
 		vector<LogicalType> rowcount_types {LogicalType::BIGINT};
 		auto materialized = make_uniq<ColumnDataCollection>(Allocator::Get(context), rowcount_types);
 		DataChunk rowcount_chunk;
@@ -433,7 +496,8 @@ bool PostgresGlobalState::TryOpenNewConnection(ClientContext &context, PostgresL
 		lock_guard<mutex> parallel_lock(lock);
 		if (!used_main_thread) {
 			if (bind_data.can_use_main_thread) {
-				lstate.connection = PostgresConnection(GetConnection().GetConnection());
+				lstate.global_connection = &GetConnection(context);
+				lstate.global_connection_id = GetConnectionId(context);
 			} else {
 				// we cannot use the main thread but we haven't initiated ANY scan yet
 				// we HAVE to open a new connection
@@ -441,10 +505,9 @@ bool PostgresGlobalState::TryOpenNewConnection(ClientContext &context, PostgresL
 					auto oauth_token_holder = SetThreadLocalOAuthTokenFromSessionOption(context);
 					lstate.pool_connection = pg_catalog->GetConnectionPool().ForceAcquire();
 				}
-				lstate.connection = PostgresConnection(lstate.pool_connection.GetConnection().GetConnection());
 				// unlike the main-thread connection this one is not in a transaction yet, so we pin it to
 				// the snapshot to prevent reads at its own instant
-				PostgresScanConnect(context, lstate.connection, snapshot, pg_catalog->access_mode,
+				PostgresScanConnect(context, lstate.GetConnection(), snapshot, pg_catalog->access_mode,
 				                    pg_catalog->isolation_level);
 			}
 			used_main_thread = true;
@@ -458,8 +521,8 @@ bool PostgresGlobalState::TryOpenNewConnection(ClientContext &context, PostgresL
 			return false;
 		}
 	}
-	lstate.connection = PostgresConnection(lstate.pool_connection.GetConnection().GetConnection());
-	PostgresScanConnect(context, lstate.connection, snapshot, pg_catalog->access_mode, pg_catalog->isolation_level);
+	PostgresScanConnect(context, lstate.GetConnection(), snapshot, pg_catalog->access_mode,
+	                    pg_catalog->isolation_level);
 	return true;
 }
 
@@ -489,17 +552,7 @@ static unique_ptr<LocalTableFunctionState> GetLocalState(ClientContext &context,
 	return std::move(local_state);
 }
 
-void PostgresGlobalState::SetPinnedConnection(PostgresPoolConnection pinned_connection,
-                                              dbconnector::attached::AttachedCatalog attached_catalog) {
-	if (this->pinned_connection) {
-		throw InternalException("Invalid global state: pinned connection alread initialized");
-	}
-	this->pinned_connection = std::move(pinned_connection);
-	this->attached_catalog = std::move(attached_catalog);
-}
-
 PostgresGlobalState::~PostgresGlobalState() {
-	connection.Close();
 	if (pinned_connection) {
 		try {
 			PostgresCatalog &catalog = attached_catalog.Get<PostgresCatalog>();
@@ -517,14 +570,30 @@ static unique_ptr<LocalTableFunctionState> PostgresInitLocalState(ExecutionConte
 	return GetLocalState(context.client, input, gstate);
 }
 
+PostgresConnection &PostgresLocalState::GetConnection() {
+	if (global_connection) {
+		return *global_connection;
+	}
+	if (pool_connection) {
+		return pool_connection.GetConnection();
+	}
+	throw InternalException("PostgresLocalState::GetConnection - no connection available");
+}
+
 void PostgresLocalState::ScanChunk(ClientContext &context, const PostgresBindData &bind_data,
                                    PostgresGlobalState &gstate, DataChunk &output) {
 	idx_t output_offset = 0;
 	if (!reader) {
-		if (bind_data.use_text_protocol) {
-			reader = make_uniq<PostgresTextReader>(context, connection, column_ids, bind_data);
+		// the statement prepared in bind can only be reused on the connection it was prepared on
+		optional_ptr<PostgresPreparedStatement> prepared_statement;
+		if (global_connection && bind_data.prepared_statement &&
+		    bind_data.prepared_statement->GetPoolConnectionId() == global_connection_id) {
+			prepared_statement = bind_data.prepared_statement.get();
+		}
+		if (use_text_protocol) {
+			reader = make_uniq<PostgresTextReader>(context, GetConnection(), column_ids, bind_data, prepared_statement);
 		} else {
-			reader = make_uniq<PostgresBinaryReader>(connection, column_ids, bind_data);
+			reader = make_uniq<PostgresBinaryReader>(GetConnection(), column_ids, bind_data, prepared_statement);
 		}
 	}
 	while (true) {
@@ -535,6 +604,7 @@ void PostgresLocalState::ScanChunk(ClientContext &context, const PostgresBindDat
 		if (!exec) {
 			reader->BeginCopy(context, sql);
 			exec = true;
+			HandleCatalogCache(context, bind_data);
 		}
 		auto read_result = reader->Read(output);
 		if (read_result == PostgresReadResult::FINISHED) {
@@ -563,7 +633,7 @@ static void PostgresScan(ClientContext &context, TableFunctionInput &data, DataC
 		// Release the PostgreSQL connection early so it is not held
 		// idle during post-scan processing (joins, aggregations, etc.)
 		local_state.reader.reset();
-		local_state.connection = PostgresConnection();
+		local_state.global_connection = nullptr;
 		local_state.pool_connection = PostgresPoolConnection();
 		return;
 	}

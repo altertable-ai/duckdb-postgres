@@ -15,6 +15,7 @@
 
 #include "postgres_conversion.hpp"
 #include "postgres_utils.hpp"
+#include "storage/postgres_catalog.hpp"
 #include "storage/postgres_transaction.hpp"
 #include "storage/postgres_schema_entry.hpp"
 
@@ -24,20 +25,72 @@ PostgresTableSet::PostgresTableSet(PostgresSchemaEntry &schema, unique_ptr<Postg
     : PostgresInSchemaSet(schema, !table_result_p), table_result(std::move(table_result_p)) {
 }
 
-string PostgresTableSet::GetInitializeQuery(const string &schema, const string &table) {
+string PostgresTableSet::GetInitializeQuery(PostgresVersion version, const string &schema, const string &table) {
 	vector<string> vec;
 	vec.push_back(schema);
-	return GetInitializeQuery(vec, table);
+	return GetInitializeQuery(version, vec, table);
 }
 
-string PostgresTableSet::GetInitializeQuery(const vector<string> &schemas, const string &table) {
+//! Expression returning 'g' for generated columns, 'd' for columns that have a default value (including SERIAL and
+//! identity columns), and NULL otherwise
+static string GetColumnDefaultExpression(PostgresVersion version) {
+	string result = "CASE";
+	if (version >= PostgresVersion(12, 0)) {
+		result += " WHEN pg_attribute.attgenerated <> '' THEN 'g'";
+	}
+	if (version >= PostgresVersion(10, 0)) {
+		result += " WHEN pg_attribute.attidentity <> '' THEN 'd'";
+	}
+	result += " WHEN pg_attribute.atthasdef THEN 'd' END";
+	return result;
+}
+
+//! Redshift late-binding views (CREATE VIEW ... WITH NO SCHEMA BINDING) have no pg_attribute entries (relnatts = 0),
+//! their columns are only exposed through pg_get_late_binding_view_cols(). The column type is returned formatted
+//! (e.g. "numeric(10,2)" or "character varying(100)"), so it is split into the type name and the type modifier here.
+static string GetRedshiftLateBindingViewQuery() {
+	return R"(
+UNION ALL
+SELECT pg_namespace.oid AS namespace_id, relname, relpages, lbv.col_name AS attname,
+    CASE WHEN lbv.paren > 0 THEN RTRIM(SUBSTRING(lbv.col_type, 1, lbv.paren - 1)) ELSE lbv.col_type END AS type_name,
+    CASE
+        WHEN lbv.paren = 0 THEN -1
+        WHEN lbv.col_type LIKE 'numeric(%' OR lbv.col_type LIKE 'decimal(%'
+            THEN SPLIT_PART(lbv.type_args, ',', 1)::INTEGER * 65536
+                + COALESCE(NULLIF(TRIM(SPLIT_PART(lbv.type_args, ',', 2)), ''), '0')::INTEGER + 4
+        WHEN lbv.col_type LIKE 'character varying(%' OR lbv.col_type LIKE 'character(%'
+            THEN lbv.type_args::INTEGER + 4
+        ELSE -1
+    END AS type_modifier,
+    0 AS ndim, lbv.col_num AS attnum, false AS notnull, NULL constraint_id,
+    NULL constraint_type, NULL constraint_key, NULL AS type_schema,
+    NULL AS column_comment,
+    tbl_desc.description AS table_comment,
+    NULL AS column_default
+FROM (
+    SELECT view_schema, view_name, col_name, col_type, col_num, STRPOS(col_type, '(') AS paren,
+        CASE WHEN STRPOS(col_type, '(') > 0
+            THEN SUBSTRING(col_type, STRPOS(col_type, '(') + 1, STRPOS(col_type, ')') - STRPOS(col_type, '(') - 1)
+        END AS type_args
+    FROM pg_get_late_binding_view_cols()
+        cols(view_schema NAME, view_name NAME, col_name NAME, col_type VARCHAR, col_num INTEGER)
+) lbv
+JOIN pg_namespace ON pg_namespace.nspname = lbv.view_schema
+JOIN pg_class ON pg_class.relnamespace = pg_namespace.oid AND pg_class.relname = lbv.view_name
+LEFT JOIN pg_description tbl_desc ON tbl_desc.objoid=pg_class.oid AND tbl_desc.objsubid=0
+WHERE relkind = 'v' ${CONDITION})";
+}
+
+string PostgresTableSet::GetInitializeQuery(PostgresVersion version, const vector<string> &schemas,
+                                            const string &table) {
 	string base_query = R"(
 SELECT pg_namespace.oid AS namespace_id, relname, relpages, attname,
     pg_type.typname type_name, atttypmod type_modifier, pg_attribute.attndims ndim,
     attnum, pg_attribute.attnotnull AS notnull, NULL constraint_id,
     NULL constraint_type, NULL constraint_key, type_ns.nspname AS type_schema,
     col_desc.description AS column_comment,
-    tbl_desc.description AS table_comment
+    tbl_desc.description AS table_comment,
+    ${COLUMN_DEFAULT} AS column_default
 FROM pg_class
 JOIN pg_namespace ON relnamespace = pg_namespace.oid
 JOIN pg_attribute ON pg_class.oid=pg_attribute.attrelid
@@ -45,13 +98,13 @@ JOIN pg_type ON atttypid=pg_type.oid
 JOIN pg_namespace type_ns ON pg_type.typnamespace = type_ns.oid
 LEFT JOIN pg_description col_desc ON col_desc.objoid=pg_class.oid AND col_desc.objsubid=pg_attribute.attnum
 LEFT JOIN pg_description tbl_desc ON tbl_desc.objoid=pg_class.oid AND tbl_desc.objsubid=0
-WHERE attnum > 0 AND relkind IN ('r', 'v', 'm', 'f', 'p') ${CONDITION}
+WHERE attnum > 0 AND relkind IN ('r', 'v', 'm', 'f', 'p') ${CONDITION}${LATE_BINDING_VIEWS}
 UNION ALL
 SELECT pg_namespace.oid AS namespace_id, relname, NULL relpages, NULL attname, NULL type_name,
     NULL type_modifier, NULL ndim, NULL attnum, NULL AS notnull,
     pg_constraint.oid AS constraint_id, contype AS constraint_type,
     conkey AS constraint_key, NULL AS type_schema,
-    NULL AS column_comment, NULL AS table_comment
+    NULL AS column_comment, NULL AS table_comment, NULL AS column_default
 FROM pg_class
 JOIN pg_namespace ON relnamespace = pg_namespace.oid
 JOIN pg_constraint ON (pg_class.oid=pg_constraint.conrelid)
@@ -65,6 +118,10 @@ ORDER BY namespace_id, relname, attnum, constraint_id;
 	if (!table.empty()) {
 		condition += "AND relname=" + PostgresUtils::WriteLiteral(table);
 	}
+	base_query = StringUtil::Replace(base_query, "${COLUMN_DEFAULT}", GetColumnDefaultExpression(version));
+	base_query = StringUtil::Replace(
+	    base_query, "${LATE_BINDING_VIEWS}",
+	    version.type_v == PostgresInstanceType::REDSHIFT ? GetRedshiftLateBindingViewQuery() : string());
 	return StringUtil::Replace(base_query, "${CONDITION}", condition);
 }
 
@@ -80,7 +137,8 @@ SELECT table_schema AS namespace_id, table_name AS relname, 0 AS relpages, colum
     data_type AS type_name, -1 AS type_modifier, 0 AS ndim, ordinal_position AS attnum,
     CASE WHEN is_nullable = 'NO' THEN 't' ELSE 'f' END AS notnull,
     NULL AS constraint_id, NULL AS constraint_type, NULL AS constraint_key,
-    NULL AS type_schema, NULL AS column_comment, NULL AS table_comment
+    NULL AS type_schema, NULL AS column_comment, NULL AS table_comment,
+    CASE WHEN column_default IS NOT NULL THEN 'd' END AS column_default
 FROM information_schema.columns
 WHERE table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast') ${CONDITION}
 ORDER BY table_schema, table_name, ordinal_position;
@@ -110,12 +168,24 @@ void PostgresTableSet::AddColumn(optional_ptr<PostgresTransaction> transaction,
 	if (!result.IsNull(row, type_schema_index)) {
 		type_info.type_schema = result.GetString(row, type_schema_index);
 	}
+	if (schema) {
+		type_info.instance_type = schema->catalog.Cast<PostgresCatalog>().GetPostgresVersion().type_v;
+	}
 	string default_value;
 
 	PostgresType postgres_type;
 	auto column_type = PostgresUtils::TypeToLogicalType(transaction, schema, type_config, type_info, postgres_type);
 	table_info.postgres_types.push_back(std::move(postgres_type));
 	table_info.postgres_names.push_back(column_name);
+	string type_name =
+	    type_info.type_schema.empty() ? string() : PostgresUtils::WriteIdentifier(type_info.type_schema) + ".";
+	table_info.postgres_type_names.push_back(type_name + PostgresUtils::WriteIdentifier(type_info.type_name));
+	auto column_default = PostgresColumnDefault::NONE;
+	if (!result.IsNull(row, 15)) {
+		column_default =
+		    result.GetString(row, 15) == "g" ? PostgresColumnDefault::GENERATED : PostgresColumnDefault::DEFAULT_VALUE;
+	}
+	table_info.column_defaults.push_back(column_default);
 	ColumnDefinition column(Identifier(std::move(column_name)), std::move(column_type));
 	if (!column_comment.empty()) {
 		column.SetComment(Value(column_comment));
@@ -212,7 +282,8 @@ void PostgresTableSet::LoadEntries(ClientContext &context, PostgresTransaction &
 	} else {
 		auto query = PostgresUtils::UseInformationSchemaIntrospection(context)
 		                 ? GetInitializeQueryInformationSchema(schema.name.GetIdentifierName())
-		                 : GetInitializeQuery(schema.name.GetIdentifierName());
+		                 : GetInitializeQuery(catalog.Cast<PostgresCatalog>().GetPostgresVersion(),
+		                                      schema.name.GetIdentifierName());
 
 		auto result = transaction.Query(query);
 		auto rows = result->Count();
@@ -247,7 +318,8 @@ unique_ptr<PostgresTableInfo> PostgresTableSet::GetTableInfo(PostgresTransaction
                                                              PostgresSchemaEntry &schema, const string &table_name) {
 	auto query = PostgresUtils::UseInformationSchemaIntrospection(transaction.GetContext())
 	                 ? GetInitializeQueryInformationSchema(schema.name.GetIdentifierName(), table_name)
-	                 : GetInitializeQuery(schema.name.GetIdentifierName(), table_name);
+	                 : GetInitializeQuery(schema.catalog.Cast<PostgresCatalog>().GetPostgresVersion(),
+	                                      schema.name.GetIdentifierName(), table_name);
 	auto result = transaction.Query(query);
 	auto rows = result->Count();
 	if (rows == 0) {
@@ -270,7 +342,7 @@ unique_ptr<PostgresTableInfo> PostgresTableSet::GetTableInfo(ClientContext &cont
                                                              const string &schema_name, const string &table_name) {
 	auto query = PostgresUtils::UseInformationSchemaIntrospection(context)
 	                 ? GetInitializeQueryInformationSchema(schema_name, table_name)
-	                 : GetInitializeQuery(schema_name, table_name);
+	                 : GetInitializeQuery(connection.GetPostgresVersion(context), schema_name, table_name);
 	auto result = connection.Query(context, query);
 	auto rows = result->Count();
 	if (rows == 0) {

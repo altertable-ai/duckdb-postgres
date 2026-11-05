@@ -1,15 +1,20 @@
 #include "storage/postgres_catalog.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "storage/postgres_table_entry.hpp"
 #include "storage/postgres_transaction.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
+#include "postgres_filter_pushdown.hpp"
 #include "postgres_scanner.hpp"
 
 namespace duckdb {
 
 PostgresTableEntry::PostgresTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info)
-    : TableCatalogEntry(catalog, schema, info) {
+    : TableCatalogEntry(catalog, schema, info), columns(std::move(info.columns)) {
 	for (idx_t c = 0; c < columns.LogicalColumnCount(); c++) {
 		auto &col = columns.GetColumnMutable(LogicalIndex(c));
 		if (col.GetType().HasAlias()) {
@@ -17,15 +22,31 @@ PostgresTableEntry::PostgresTableEntry(Catalog &catalog, SchemaCatalogEntry &sch
 		}
 		postgres_types.push_back(PostgresUtils::CreateEmptyPostgresType(col.GetType()));
 		postgres_names.push_back(col.GetName().GetIdentifierName());
+		if (col.Generated()) {
+			column_defaults.push_back(PostgresColumnDefault::GENERATED);
+		} else if (col.HasDefaultValue()) {
+			column_defaults.push_back(PostgresColumnDefault::DEFAULT_VALUE);
+		} else {
+			column_defaults.push_back(PostgresColumnDefault::NONE);
+		}
 	}
 	approx_num_pages.store(0, std::memory_order_release);
 }
 
 PostgresTableEntry::PostgresTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, PostgresTableInfo &info)
-    : TableCatalogEntry(catalog, schema, *info.create_info), postgres_types(std::move(info.postgres_types)),
-      postgres_names(std::move(info.postgres_names)) {
-	D_ASSERT(postgres_types.size() == columns.LogicalColumnCount());
+    : TableCatalogEntry(catalog, schema, *info.create_info), columns(std::move(info.create_info->columns)),
+      postgres_types(std::move(info.postgres_types)), postgres_names(std::move(info.postgres_names)),
+      postgres_type_names(std::move(info.postgres_type_names)), column_defaults(std::move(info.column_defaults)) {
+	if (postgres_types.size() != columns.LogicalColumnCount() ||
+	    column_defaults.size() != columns.LogicalColumnCount()) {
+		throw InternalException("PostgresTableEntry: column count mismatch - %llu columns, %llu types, %llu defaults",
+		                        columns.LogicalColumnCount(), postgres_types.size(), column_defaults.size());
+	}
 	approx_num_pages.store(info.approx_num_pages, std::memory_order_release);
+}
+
+const ColumnList &PostgresTableEntry::GetColumns() const {
+	return columns;
 }
 
 unique_ptr<BaseStatistics> PostgresTableEntry::GetStatistics(ClientContext &context, column_t column_id) {
@@ -40,28 +61,32 @@ TableFunction PostgresTableEntry::GetScanFunction(ClientContext &context, unique
 	auto &pg_catalog = catalog.Cast<PostgresCatalog>();
 	auto &transaction = Transaction::Get(context, catalog).Cast<PostgresTransaction>();
 
-	auto result = make_uniq<PostgresBindData>(context);
+	auto result = make_uniq<PostgresBindData>(context, pg_catalog.GetName());
 
 	result->schema_name = schema.name.GetIdentifierName();
 	result->table_name = name.GetIdentifierName();
 	result->dsn = transaction.GetDSN();
 	result->attach_path = pg_catalog.attach_path;
-	result->SetCatalog(pg_catalog);
-	result->SetTable(*this);
+	result->qualified_table_name = QualifiedName(ParentCatalog().GetName(), ParentSchema().name, name);
+	result->context_ptr = transaction.context;
 	for (auto &col : columns.Logical()) {
 		result->types.push_back(col.GetType());
 	}
 	result->names = postgres_names;
 	result->postgres_types = postgres_types;
 	result->read_only = transaction.IsReadOnly();
+	result->type_config = PostgresTypeConfig::FromContext(context);
 	PostgresScanFunction::PrepareBind(pg_catalog.GetPostgresVersion(), context, *result,
-	                                  approx_num_pages.load(std::memory_order_acquire));
+	                                  approx_num_pages.load(std::memory_order_acquire), pg_catalog);
 
 	bind_data = std::move(result);
 	auto function = PostgresScanFunction();
 	Value filter_pushdown;
-	if (context.TryGetCurrentSetting("pg_experimental_filter_pushdown", filter_pushdown)) {
+	if (context.TryGetCurrentSetting("pg_enable_filter_pushdown", filter_pushdown)) {
 		function.filter_pushdown = BooleanValue::Get(filter_pushdown);
+	}
+	if (function.filter_pushdown) {
+		function.pushdown_expression = PostgresFilterPushdown::CanPushExpressionDown;
 	}
 	return function;
 }
@@ -133,19 +158,49 @@ static bool CopyRequiresText(const LogicalType &type, const PostgresType &pg_typ
 }
 
 PostgresCopyFormat PostgresTableEntry::GetCopyFormat(ClientContext &context) {
-	Value use_binary_copy;
-	if (context.TryGetCurrentSetting("pg_use_binary_copy", use_binary_copy)) {
-		if (!BooleanValue::Get(use_binary_copy)) {
-			return PostgresCopyFormat::TEXT;
+	PostgresQueryMode query_mode = PostgresUtils::ExtractQueryMode(context);
+	switch (query_mode) {
+	case PostgresQueryMode::COPY_BINARY:
+	case PostgresQueryMode::PLAIN_QUERY_BINARY:
+		return GetBinaryCopyFormatIfTypesAllow();
+	case PostgresQueryMode::PLAIN_QUERY_TEXT:
+		return PostgresCopyFormat::TEXT;
+	default: {
+		Value use_binary_copy;
+		if (context.TryGetCurrentSetting("pg_use_binary_copy", use_binary_copy)) {
+			if (!BooleanValue::Get(use_binary_copy)) {
+				return PostgresCopyFormat::TEXT;
+			}
 		}
+		return GetBinaryCopyFormatIfTypesAllow();
 	}
-	D_ASSERT(postgres_types.size() == columns.LogicalColumnCount());
+	}
+}
+
+PostgresCopyFormat PostgresTableEntry::GetBinaryCopyFormatIfTypesAllow() {
+	idx_t types_count = postgres_types.size();
+	idx_t columns_count = columns.LogicalColumnCount();
+	if (types_count != columns_count) {
+		throw IOException("Schema discrepancy detected, types count: %llu, columns count: %llu", types_count,
+		                  columns_count);
+	}
 	for (idx_t c = 0; c < postgres_types.size(); c++) {
 		if (CopyRequiresText(columns.GetColumn(LogicalIndex(c)).GetType(), postgres_types[c])) {
 			return PostgresCopyFormat::TEXT;
 		}
 	}
 	return PostgresCopyFormat::BINARY;
+}
+
+dbconnector::attached::AttachedTable PostgresTableEntry::Lookup(ClientContext &ctx, QualifiedName name) {
+	using namespace dbconnector::attached;
+
+	AttachedTable table = AttachedTable::Lookup(ctx, "postgres", name);
+	if (!table) {
+		throw InvalidInputException("Attached PostgreSQL table, name: %s is not found in the specified client session",
+		                            name.ToString());
+	}
+	return table;
 }
 
 } // namespace duckdb

@@ -9,6 +9,7 @@
 #pragma once
 
 #include "postgres_utils.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "postgres_result.hpp"
 #include "duckdb/function/copy_function.hpp"
 
@@ -34,7 +35,7 @@ public:
 	                                        GlobalFunctionData &gstate);
 
 	static unique_ptr<FunctionData> PostgresBinaryReadBind(ClientContext &context, CopyFromFunctionBindInput &info,
-	                                                       vector<string> &expected_names,
+	                                                       vector<Identifier> &expected_names,
 	                                                       vector<LogicalType> &expected_types);
 };
 

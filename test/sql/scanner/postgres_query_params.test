@@ -6,10 +6,6 @@ require postgres_scanner
 
 require-env POSTGRES_TEST_DATABASE_AVAILABLE
 
-# COPY does not support parameters: ERROR:  there is no parameter $1
-statement ok
-SET pg_use_text_protocol=true
-
 statement ok
 ATTACH 'dbname=postgresscanner' AS s1 (TYPE POSTGRES)
 
@@ -108,3 +104,64 @@ query I
 FROM postgres_query('s1', 'SELECT $1::DOUBLE PRECISION', params=row(42.123::DOUBLE))
 ----
 42.123
+
+statement error
+FROM postgres_query('s1', 'SELECT $1::INTEGER, $2::TEXT',
+    params=row(42, 'foo'),
+    query_mode='COPY_BINARY')
+----
+Failed to prepare COPY
+
+statement ok
+SET pg_query_mode = 'COPY_BINARY'
+
+statement error
+FROM postgres_query('s1', 'SELECT $1::INTEGER, $2::TEXT',
+    params=row(42, 'foo'))
+----
+Failed to prepare COPY
+
+query II
+FROM postgres_query('s1', 'SELECT $1::INTEGER, $2::TEXT',
+    params=row(42, 'foo'),
+    query_mode='PLAIN_QUERY_BINARY')
+----
+42	foo
+
+query II
+FROM postgres_query('s1', 'SELECT $1::INTEGER, $2::TEXT',
+    params=row(42, 'foo'),
+    query_mode='PLAIN_QUERY_TEXT')
+----
+42	foo
+
+statement ok
+RESET pg_query_mode
+
+# statements without result columns
+statement ok
+CALL postgres_execute('s1', 'DROP TABLE IF EXISTS execute_params_tbl')
+
+statement ok
+CALL postgres_execute('s1', 'CREATE TABLE execute_params_tbl (i INTEGER)')
+
+query I
+FROM postgres_execute('s1', 'INSERT INTO execute_params_tbl VALUES ($1)', params=row(42))
+----
+1
+
+query I
+FROM postgres_query('s1', 'SELECT i FROM execute_params_tbl')
+----
+42
+
+statement error
+CALL postgres_execute('s1', 'INSERT INTO execute_params_tbl VALUES ($1)', params=row(42, 43))
+----
+Incorrect number of parameters specified, expected: 1, actual: 2
+
+statement ok
+CALL postgres_execute('s1', 'DROP TABLE execute_params_tbl')
+
+statement ok
+DETACH s1

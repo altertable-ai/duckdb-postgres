@@ -9,9 +9,12 @@
 #pragma once
 
 #include "duckdb/transaction/transaction.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/shared_ptr.hpp"
+#include "duckdb/common/thread.hpp"
 
 namespace duckdb {
 struct DropInfo;
@@ -29,6 +32,8 @@ public:
 	          const std::function<void(CatalogEntry &)> &callback);
 	virtual optional_ptr<CatalogEntry> CreateEntry(PostgresTransaction &transaction, shared_ptr<CatalogEntry> entry);
 	void ClearEntries();
+	//! Remove an entry from the cache (without dropping it) - it is reloaded when it is looked up the next time
+	void InvalidateEntry(const string &name);
 	virtual bool SupportReload() const {
 		return false;
 	}
@@ -41,7 +46,24 @@ protected:
 	virtual bool HasInternalDependencies() const {
 		return false;
 	}
+	//! Empty (default) means staleness is never checked once loaded
+	virtual string GetStalenessQuery(ClientContext &context) const {
+		return string();
+	}
 	void TryLoadEntries(ClientContext &context, PostgresTransaction &transaction);
+	void RefreshStalenessSignature(PostgresTransaction &transaction, bool use_transaction_connection);
+
+private:
+	//! Runs LoadEntries + RefreshStalenessSignature, must be called with load_lock held
+	void LoadEntriesLocked(ClientContext &context, PostgresTransaction &transaction);
+	//! Must be called with load_lock held
+	void ClearEntriesLocked();
+	//! Returns with entry_lock held
+	unique_lock<mutex> LoadEntriesForRead(ClientContext &context, PostgresTransaction &transaction);
+
+protected:
+public:
+	void PromoteStalenessSignature(string signature);
 
 protected:
 	Catalog &catalog;
@@ -52,6 +74,8 @@ private:
 	unordered_map<string, shared_ptr<CatalogEntry>> entries;
 	case_insensitive_map_t<string> entry_map;
 	atomic<bool> is_loaded;
+	atomic<thread_id> loading_thread;
+	string staleness_signature;
 };
 
 class PostgresInSchemaSet : public PostgresCatalogSet {

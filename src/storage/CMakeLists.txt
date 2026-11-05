@@ -1,10 +1,10 @@
 add_library(
   postgres_ext_storage OBJECT
+  postgres_capabilities.cpp
   postgres_catalog.cpp
   postgres_catalog_set.cpp
   postgres_connection_pool.cpp
   postgres_clear_cache.cpp
-  postgres_configure_pool.cpp
   postgres_delete.cpp
   postgres_index.cpp
   postgres_index_entry.cpp
@@ -18,7 +18,6 @@ add_library(
   postgres_table_entry.cpp
   postgres_table_set.cpp
   postgres_transaction.cpp
-  postgres_transaction_manager.cpp
   postgres_type_entry.cpp
   postgres_type_set.cpp
   postgres_update.cpp)

@@ -1,29 +1,22 @@
+#include "postgres_connection.hpp"
+
 #include "duckdb/storage/table_storage_info.hpp"
+#include "duckdb/logging/logger.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/column_list.hpp"
 #include "duckdb/parser/parser.hpp"
-#include "postgres_connection.hpp"
-#include "postgres_logging.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/helper.hpp"
+
+#include "postgres_logging.hpp"
+#include "postgres_prepared_statement.hpp"
 
 namespace duckdb {
 
 static bool debug_postgres_print_queries = false;
 
-OwnedPostgresConnection::OwnedPostgresConnection(PGconn *conn) : connection(conn) {
-}
-
-OwnedPostgresConnection::~OwnedPostgresConnection() {
-	if (!connection) {
-		return;
-	}
-	PQfinish(connection);
-	connection = nullptr;
-}
-
-PostgresConnection::PostgresConnection(shared_ptr<OwnedPostgresConnection> connection_p)
-    : connection(std::move(connection_p)) {
+PostgresConnection::PostgresConnection(PGconn *connection_p) : connection(connection_p) {
 }
 
 PostgresConnection::~PostgresConnection() {
@@ -31,11 +24,18 @@ PostgresConnection::~PostgresConnection() {
 }
 
 PostgresConnection::PostgresConnection(PostgresConnection &&other) noexcept {
+	lock_guard<mutex> guard(other.connection_lock);
 	std::swap(connection, other.connection);
 	std::swap(dsn, other.dsn);
 }
 
 PostgresConnection &PostgresConnection::operator=(PostgresConnection &&other) noexcept {
+	if (this == &other) {
+		return *this;
+	}
+	std::lock(connection_lock, other.connection_lock);
+	lock_guard<mutex> guard(connection_lock, std::adopt_lock);
+	lock_guard<mutex> other_guard(other.connection_lock, std::adopt_lock);
 	std::swap(connection, other.connection);
 	std::swap(dsn, other.dsn);
 	return *this;
@@ -43,7 +43,7 @@ PostgresConnection &PostgresConnection::operator=(PostgresConnection &&other) no
 
 PostgresConnection PostgresConnection::Open(const string &dsn, const string &attach_path) {
 	PostgresConnection result;
-	result.connection = make_shared_ptr<OwnedPostgresConnection>(PostgresUtils::PGConnect(dsn, attach_path));
+	result.connection = PostgresUtils::PGConnect(dsn, attach_path);
 	result.dsn = dsn;
 	return result;
 }
@@ -62,7 +62,7 @@ static bool ResultHasError(PGresult *result) {
 }
 
 PGresult *PostgresConnection::PQExecute(optional_ptr<ClientContext> context, const string &query,
-                                        const PostgresParameters &params) {
+                                        const PostgresParameters &params, int format) {
 	if (PostgresConnection::DebugPrintQueries()) {
 		Printer::Print(query + "\n");
 	}
@@ -73,11 +73,10 @@ PGresult *PostgresConnection::PQExecute(optional_ptr<ClientContext> context, con
 	PGconn *conn = GetConn();
 	PGresult *res = nullptr;
 
-	if (params.Empty()) {
+	if (params.Empty() && format == 0) {
 		res = PQexec(GetConn(), query.c_str());
 	} else {
 		// Unlike PQexec, PQexecParams allows at most one SQL command in the given string.
-		int format = 0; // text format
 		res = PQexecParams(conn, query.c_str(), params.Count(), params.Types(), params.Values(), params.Lengths(),
 		                   params.Formats(), format);
 	}
@@ -93,14 +92,14 @@ PGresult *PostgresConnection::PQExecute(optional_ptr<ClientContext> context, con
 
 unique_ptr<PostgresResult> PostgresConnection::TryQuery(optional_ptr<ClientContext> context, const string &query,
                                                         optional_ptr<string> error_message,
-                                                        const PostgresParameters &params) {
-	lock_guard<mutex> guard(connection->connection_lock);
-	auto result = PQExecute(context, query.c_str(), params);
+                                                        const PostgresParameters &params, int format) {
+	lock_guard<mutex> guard(connection_lock);
+	auto result = PQExecute(context, query.c_str(), params, format);
 
 	if (ResultHasError(result)) {
 		if (error_message) {
-			*error_message = StringUtil::Format("Failed to execute query \"" + query +
-			                                    "\": " + string(PQresultErrorMessage(result)));
+			auto error = result ? PQresultErrorMessage(result) : PQerrorMessage(GetConn());
+			*error_message = StringUtil::Format("Failed to execute query \"" + query + "\": " + string(error));
 		}
 		PQclear(result);
 		return nullptr;
@@ -109,18 +108,51 @@ unique_ptr<PostgresResult> PostgresConnection::TryQuery(optional_ptr<ClientConte
 }
 
 unique_ptr<PostgresResult> PostgresConnection::Query(optional_ptr<ClientContext> context, const string &query,
-                                                     const PostgresParameters &params) {
+                                                     const PostgresParameters &params, int format) {
 	string error_msg;
-	auto result = TryQuery(context, query, &error_msg, params);
+	auto result = TryQuery(context, query, &error_msg, params, format);
 	if (!result) {
 		throw std::runtime_error(error_msg);
 	}
 	return result;
 }
 
+unique_ptr<PostgresResult> PostgresConnection::QueryStmt(optional_ptr<ClientContext> context,
+                                                         const PostgresPreparedStatement &stmt,
+                                                         const PostgresParameters &params, int format) {
+	auto &query = stmt.GetQuery();
+	if (PostgresConnection::DebugPrintQueries()) {
+		Printer::Print(query + "\n");
+	}
+	int64_t start_time = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
+	                         .time_since_epoch()
+	                         .count();
+
+	lock_guard<mutex> guard(connection_lock);
+	PGconn *conn = GetConn();
+	PGresult *result = PQexecPrepared(conn, stmt.GetName().c_str(), params.Count(), params.Values(), params.Lengths(),
+	                                  params.Formats(), format);
+
+	int64_t end_time = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
+	                       .time_since_epoch()
+	                       .count();
+	if (context) {
+		DUCKDB_LOG(*context, PostgresQueryLogType, query, end_time - start_time);
+	}
+
+	if (ResultHasError(result)) {
+		auto error = result ? PQresultErrorMessage(result) : PQerrorMessage(conn);
+		auto error_message = StringUtil::Format("Failed to execute prepared statement \"%s\" for query \"%s\": %s",
+		                                        stmt.GetName(), query, string(error));
+		PQclear(result);
+		throw std::runtime_error(error_message);
+	}
+	return make_uniq<PostgresResult>(result);
+}
+
 void PostgresConnection::Execute(optional_ptr<ClientContext> context, const string &query,
-                                 const PostgresParameters &params) {
-	Query(context, query, params);
+                                 const PostgresParameters &params, int format) {
+	Query(context, query, params, format);
 }
 
 vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientContext &context, const string &queries) {
@@ -130,11 +162,13 @@ vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientCont
 	int64_t start_time = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
 	                         .time_since_epoch()
 	                         .count();
+	lock_guard<mutex> guard(connection_lock);
 	auto res = PQsendQuery(GetConn(), queries.c_str());
 	if (res == 0) {
 		throw std::runtime_error("Failed to execute query \"" + queries + "\": " + string(PQerrorMessage(GetConn())));
 	}
 	vector<unique_ptr<PostgresResult>> results;
+	string error_message;
 	while (true) {
 		auto res = PQgetResult(GetConn());
 		if (!res) {
@@ -142,13 +176,18 @@ vector<unique_ptr<PostgresResult>> PostgresConnection::ExecuteQueries(ClientCont
 		}
 		auto result = make_uniq<PostgresResult>(res);
 		if (ResultHasError(res)) {
-			throw std::runtime_error("Failed to execute query \"" + queries +
-			                         "\": " + string(PQresultErrorMessage(res)));
+			if (error_message.empty()) {
+				error_message = "Failed to execute query \"" + queries + "\": " + string(PQresultErrorMessage(res));
+			}
+			continue;
 		}
 		if (PQresultStatus(res) != PGRES_TUPLES_OK) {
 			continue;
 		}
 		results.push_back(std::move(result));
+	}
+	if (!error_message.empty()) {
+		throw std::runtime_error(error_message);
 	}
 	int64_t end_time = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
 	                       .time_since_epoch()
@@ -176,17 +215,24 @@ PostgresVersion PostgresConnection::GetPostgresVersion(ClientContext &context) {
 }
 
 bool PostgresConnection::IsOpen() {
-	return connection.get();
+	return connection != nullptr;
 }
 
 void PostgresConnection::Close() {
-	if (!IsOpen()) {
+	lock_guard<mutex> guard(connection_lock);
+	if (!connection) {
 		return;
 	}
+	PQfinish(connection);
 	connection = nullptr;
 }
 
 bool PostgresConnection::PingServer(const std::string &health_check_query) {
+	lock_guard<mutex> guard(connection_lock);
+	return PingServerInternal(health_check_query);
+}
+
+bool PostgresConnection::PingServerInternal(const std::string &health_check_query) {
 	if (!IsOpen()) {
 		return false;
 	}
@@ -203,6 +249,7 @@ bool PostgresConnection::PingServer(const std::string &health_check_query) {
 }
 
 void PostgresConnection::Reset(const std::string &health_check_query) {
+	lock_guard<mutex> guard(connection_lock);
 	if (!IsOpen()) {
 		throw InternalException("Cannot reset a connection that is not open");
 	}
@@ -220,7 +267,7 @@ void PostgresConnection::Reset(const std::string &health_check_query) {
 		}
 	}
 	PQreset(conn);
-	if (!PingServer(health_check_query)) {
+	if (!PingServerInternal(health_check_query)) {
 		throw InternalException("Connection reset failure");
 	}
 }

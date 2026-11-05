@@ -1,4 +1,8 @@
 #include "storage/postgres_catalog.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/planner/logical_operator.hpp"
 #include "storage/postgres_index.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
@@ -25,19 +29,21 @@ SourceResultType PostgresCreateIndex::GetDataInternal(ExecutionContext &context,
 	auto &catalog = table.catalog;
 	auto &schema = table.schema;
 	auto transaction = catalog.GetCatalogTransaction(context.client);
-	auto existing = schema.GetEntry(transaction, CatalogType::INDEX_ENTRY, info->index_name);
+	auto existing = schema.GetEntry(transaction, CatalogType::INDEX_ENTRY, info->GetIndexName());
 	if (existing) {
 		switch (info->on_conflict) {
 		case OnCreateConflict::IGNORE_ON_CONFLICT:
 			return SourceResultType::FINISHED;
 		case OnCreateConflict::ERROR_ON_CONFLICT:
-			throw BinderException("Index with name \"%s\" already exists in schema \"%s\"", info->index_name,
+			throw BinderException("Index with name \"%s\" already exists in schema \"%s\"", info->GetIndexName(),
 			                      table.schema.name);
 		case OnCreateConflict::REPLACE_ON_CONFLICT: {
 			DropInfo drop_info;
 			drop_info.type = CatalogType::INDEX_ENTRY;
-			drop_info.schema = info->schema;
-			drop_info.name = info->index_name;
+			drop_info.SetQualifiedName(QualifiedName(drop_info.GetQualifiedName().Catalog(),
+			                                         info->GetQualifiedName().Schema(),
+			                                         drop_info.GetQualifiedName().Name()));
+			drop_info.SetName(info->GetIndexName());
 			schema.DropEntry(context.client, drop_info);
 			break;
 		}

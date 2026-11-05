@@ -1,4 +1,5 @@
 #include "postgres_binary_parser.hpp"
+#include "duckdb/common/operator/double_cast_operator.hpp"
 #include "duckdb/common/types/geometry.hpp"
 
 #include "duckdb/common/vector/flat_vector.hpp"
@@ -7,8 +8,9 @@
 
 namespace duckdb {
 
-PostgresBinaryParser::PostgresBinaryParser(vector<LogicalType> types_p, vector<PostgresType> postgres_types_p)
-    : types(std::move(types_p)), postgres_types(std::move(postgres_types_p)) {
+PostgresBinaryParser::PostgresBinaryParser(vector<LogicalType> types_p, vector<PostgresType> postgres_types_p,
+                                           PostgresTypeConfig type_config_p)
+    : types(std::move(types_p)), postgres_types(std::move(postgres_types_p)), type_config(type_config_p) {
 }
 
 void PostgresBinaryParser::SetBuffer(data_ptr_t buf, idx_t len) {
@@ -22,16 +24,19 @@ bool PostgresBinaryParser::ReadChunk(DataChunk &output, const vector<column_t> &
 			return false;
 		}
 
-		auto tuple_count = ReadInteger<int16_t>();
-		if (tuple_count <= 0) {
-			// tuple_count of -1 signifies the file trailer (i.e. footer)
+		auto field_count = ReadInteger<int16_t>();
+		if (field_count <= 0) {
+			// a field count of -1 signifies the file trailer (i.e. footer)
 			// clear the buffer so Ready() returns false and the caller can free it
 			buffer_ptr = nullptr;
 			end = nullptr;
 			continue;
 		}
 
-		D_ASSERT(tuple_count == column_ids.size());
+		if (field_count != column_ids.size()) {
+			throw InvalidInputException("Postgres binary reader - expected %llu field(s) per row, got %d",
+			                            column_ids.size(), field_count);
+		}
 
 		idx_t output_offset = output.size();
 		for (idx_t output_idx = 0; output_idx < output.ColumnCount(); output_idx++) {
@@ -45,9 +50,14 @@ bool PostgresBinaryParser::ReadChunk(DataChunk &output, const vector<column_t> &
 				ReadValue(types[col_idx], postgres_types[col_idx], out_vec, output_offset);
 			}
 		}
-		output.SetChildCardinality(output_offset + 1);
+		// only update the count; this runs every row, and SetChildCardinality would visit every vector each time
+		output.SetCardinalityUnsafe(output_offset + 1);
 	}
 	return true;
+}
+
+void PostgresBinaryParser::ThrowOutOfBuffer(const char *function_name) {
+	throw IOException("Postgres binary reader - out of buffer in %s", function_name);
 }
 
 void PostgresBinaryParser::CheckHeader() {
@@ -58,7 +68,9 @@ void PostgresBinaryParser::CheckHeader() {
 	if (!buffer_ptr) {
 		throw IOException("buffer_ptr not set in CheckHeader");
 	}
-	if (buffer_ptr + header_len >= end) {
+	// a buffer holding exactly the header is valid - the reader hands one over when the first row does
+	// not fit alongside it
+	if (buffer_ptr + header_len > end) {
 		throw IOException("Unable to read binary COPY data, invalid header");
 	}
 	if (memcmp(buffer_ptr, PostgresConversion::COPY_HEADER, magic_len) != 0) {
@@ -79,10 +91,48 @@ PostgresDecimalConfig PostgresBinaryParser::ReadDecimalConfig() {
 	      sign == NUMERIC_NEG)) {
 		throw NotImplementedException("Postgres numeric NA/Inf");
 	}
+	config.sign = sign;
 	config.is_negative = sign == NUMERIC_NEG;
 	config.scale = ReadInteger<uint16_t>();
 
 	return config;
+}
+
+PostgresDecimal<double> PostgresBinaryParser::ReadDecimalAsDouble() {
+	const auto config = ReadDecimalConfig();
+	if (config.sign == NUMERIC_NAN || config.sign == NUMERIC_PINF || config.sign == NUMERIC_NINF) {
+		return PostgresDecimal<double>(NonFiniteDecimalKindFromSign(config.sign));
+	}
+	if (config.ndigits == 0) {
+		return PostgresDecimal<double>(0);
+	}
+
+	// A scientific exponent avoids expanding implicit zero groups or applying the display scale.
+	const auto exponent = (int32_t(config.weight) + 1 - int32_t(config.ndigits)) * DEC_DIGITS;
+	const auto exponent_text = std::to_string(exponent);
+	// Preserve the base-10000 digits and round only once when converting to DOUBLE.
+	string text;
+	text.reserve(idx_t(config.ndigits) * DEC_DIGITS + exponent_text.size() + 1 + config.is_negative);
+	if (config.is_negative) {
+		text.push_back('-');
+	}
+	for (idx_t i = 0; i < config.ndigits; i++) {
+		const auto digit = ReadInteger<uint16_t>();
+		if (digit >= NBASE) {
+			throw InvalidInputException("Invalid Postgres numeric digit: %d", digit);
+		}
+		text.push_back(char('0' + digit / 1000));
+		text.push_back(char('0' + (digit / 100) % 10));
+		text.push_back(char('0' + (digit / 10) % 10));
+		text.push_back(char('0' + digit % 10));
+	}
+	text.push_back('e');
+	text += exponent_text;
+	double result = 0;
+	if (!TryDoubleCast(text.c_str(), text.size(), result, false)) {
+		throw InvalidInputException("Could not convert Postgres numeric to DOUBLE");
+	}
+	return PostgresDecimal<double>(result);
 }
 
 void PostgresBinaryParser::ReadGeometry(const LogicalType &type, const PostgresType &postgres_type, Vector &out_vec,
@@ -149,47 +199,85 @@ void PostgresBinaryParser::ReadArray(const LogicalType &type, const PostgresType
 	ListVector::SetListSize(out_vec, child_offset + child_count);
 }
 
+// Defined out of line so the length checks that call it stay small enough to inline
+[[noreturn]] static void ThrowValueLengthMismatch(int32_t value_len, idx_t expected_len, const LogicalType &type) {
+	throw InvalidInputException("Postgres binary reader - expected %llu bytes for a value of type %s, got %d",
+	                            expected_len, type.ToString(), value_len);
+}
+
+// Check that the length of the value Postgres sent matches the length we expect. COPY format only
+// tells us the length of the value, so this is the only check we have that the data matches the
+// type we expect.
+static void CheckValueLength(int32_t value_len, idx_t expected_len, const LogicalType &type) {
+	if (value_len != expected_len) {
+		ThrowValueLengthMismatch(value_len, expected_len, type);
+	}
+}
+
 void PostgresBinaryParser::ReadValue(const LogicalType &type, const PostgresType &postgres_type, Vector &out_vec,
                                      idx_t output_offset) {
 	auto value_len = ReadInteger<int32_t>();
+	ParseValue(type, postgres_type, value_len, out_vec, output_offset);
+}
+
+void PostgresBinaryParser::ParseValue(const LogicalType &type, const PostgresType &postgres_type, int32_t value_len,
+                                      Vector &out_vec, idx_t output_offset) {
 	if (value_len == -1) { // NULL
 		FlatVector::SetNull(out_vec, output_offset, true);
 		return;
 	}
 	switch (type.id()) {
 	case LogicalTypeId::SMALLINT:
-		D_ASSERT(value_len == sizeof(int16_t));
+		CheckValueLength(value_len, sizeof(int16_t), type);
 		FlatVector::GetDataMutable<int16_t>(out_vec)[output_offset] = ReadInteger<int16_t>();
 		break;
 	case LogicalTypeId::INTEGER:
-		D_ASSERT(value_len == sizeof(int32_t));
+		CheckValueLength(value_len, sizeof(int32_t), type);
 		FlatVector::GetDataMutable<int32_t>(out_vec)[output_offset] = ReadInteger<int32_t>();
 		break;
 	case LogicalTypeId::UINTEGER:
-		D_ASSERT(value_len == sizeof(uint32_t));
+		CheckValueLength(value_len, sizeof(uint32_t), type);
 		FlatVector::GetDataMutable<uint32_t>(out_vec)[output_offset] = ReadInteger<uint32_t>();
 		break;
 	case LogicalTypeId::BIGINT:
 		if (postgres_type.info == PostgresTypeAnnotation::CTID) {
-			D_ASSERT(value_len == 6);
+			CheckValueLength(value_len, sizeof(int32_t) + sizeof(int16_t), type);
 			int64_t page_index = ReadInteger<int32_t>();
 			int64_t row_in_page = ReadInteger<int16_t>();
 			FlatVector::GetDataMutable<int64_t>(out_vec)[output_offset] = (page_index << 16LL) + row_in_page;
 			return;
 		}
-		D_ASSERT(value_len == sizeof(int64_t));
+		CheckValueLength(value_len, sizeof(int64_t), type);
 		FlatVector::GetDataMutable<int64_t>(out_vec)[output_offset] = ReadInteger<int64_t>();
 		break;
 	case LogicalTypeId::FLOAT:
-		D_ASSERT(value_len == sizeof(float));
+		CheckValueLength(value_len, sizeof(float), type);
 		FlatVector::GetDataMutable<float>(out_vec)[output_offset] = ReadFloat();
 		break;
 	case LogicalTypeId::DOUBLE: {
 		if (postgres_type.info == PostgresTypeAnnotation::NUMERIC_AS_DOUBLE) {
-			FlatVector::GetDataMutable<double>(out_vec)[output_offset] = ReadDecimal<double, DecimalConversionDouble>();
+			auto dec = ReadDecimalAsDouble();
+			double double_value = 0;
+			switch (dec.kind) {
+			case PostgresDecimalKind::ORDINARY:
+				double_value = dec.value;
+				break;
+			case PostgresDecimalKind::NOT_A_NUMBER:
+				double_value = std::numeric_limits<double>::quiet_NaN();
+				break;
+			case PostgresDecimalKind::POSITIVE_INFINITY:
+				double_value = std::numeric_limits<double>::infinity();
+				break;
+			case PostgresDecimalKind::NEGATIVE_INFINITY:
+				double_value = -std::numeric_limits<double>::infinity();
+				break;
+			default:
+				throw InvalidInputException("Unsupported decimal kind");
+			}
+			FlatVector::GetDataMutable<double>(out_vec)[output_offset] = double_value;
 			break;
 		}
-		D_ASSERT(value_len == sizeof(double));
+		CheckValueLength(value_len, sizeof(double), type);
 		FlatVector::GetDataMutable<double>(out_vec)[output_offset] = ReadDouble();
 		break;
 	}
@@ -225,7 +313,7 @@ void PostgresBinaryParser::ReadValue(const LogicalType &type, const PostgresType
 		break;
 	}
 	case LogicalTypeId::BOOLEAN:
-		D_ASSERT(value_len == sizeof(bool));
+		CheckValueLength(value_len, sizeof(bool), type);
 		FlatVector::GetDataMutable<bool>(out_vec)[output_offset] = ReadBoolean();
 		break;
 	case LogicalTypeId::DECIMAL: {
@@ -233,19 +321,34 @@ void PostgresBinaryParser::ReadValue(const LogicalType &type, const PostgresType
 			throw InvalidInputException("Need at least 8 bytes to read a Postgres decimal. Got %d", value_len);
 		}
 		switch (type.InternalType()) {
-		case PhysicalType::INT16:
-			FlatVector::GetDataMutable<int16_t>(out_vec)[output_offset] = ReadDecimal<int16_t>();
+		case PhysicalType::INT16: {
+			PostgresDecimal<int16_t> dec = ReadDecimal<int16_t>();
+			if (!CheckDecimalKindSetNull(out_vec, output_offset, dec.kind)) {
+				FlatVector::GetDataMutable<int16_t>(out_vec)[output_offset] = dec.value;
+			}
 			break;
-		case PhysicalType::INT32:
-			FlatVector::GetDataMutable<int32_t>(out_vec)[output_offset] = ReadDecimal<int32_t>();
+		}
+		case PhysicalType::INT32: {
+			PostgresDecimal<int32_t> dec = ReadDecimal<int32_t>();
+			if (!CheckDecimalKindSetNull(out_vec, output_offset, dec.kind)) {
+				FlatVector::GetDataMutable<int32_t>(out_vec)[output_offset] = dec.value;
+			}
 			break;
-		case PhysicalType::INT64:
-			FlatVector::GetDataMutable<int64_t>(out_vec)[output_offset] = ReadDecimal<int64_t>();
+		}
+		case PhysicalType::INT64: {
+			PostgresDecimal<int64_t> dec = ReadDecimal<int64_t>();
+			if (!CheckDecimalKindSetNull(out_vec, output_offset, dec.kind)) {
+				FlatVector::GetDataMutable<int64_t>(out_vec)[output_offset] = dec.value;
+			}
 			break;
-		case PhysicalType::INT128:
-			FlatVector::GetDataMutable<hugeint_t>(out_vec)[output_offset] =
-			    ReadDecimal<hugeint_t, DecimalConversionHugeint>();
+		}
+		case PhysicalType::INT128: {
+			PostgresDecimal<hugeint_t> dec = ReadDecimal<hugeint_t, DecimalConversionHugeint>();
+			if (!CheckDecimalKindSetNull(out_vec, output_offset, dec.kind)) {
+				FlatVector::GetDataMutable<hugeint_t>(out_vec)[output_offset] = dec.value;
+			}
 			break;
+		}
 		default:
 			throw InvalidInputException("Unsupported decimal storage type");
 		}
@@ -253,24 +356,24 @@ void PostgresBinaryParser::ReadValue(const LogicalType &type, const PostgresType
 	}
 
 	case LogicalTypeId::DATE: {
-		D_ASSERT(value_len == sizeof(int32_t));
+		CheckValueLength(value_len, sizeof(int32_t), type);
 		auto out_ptr = FlatVector::GetDataMutable<date_t>(out_vec);
 		out_ptr[output_offset] = ReadDate();
 		break;
 	}
 	case LogicalTypeId::TIME: {
-		D_ASSERT(value_len == sizeof(int64_t));
+		CheckValueLength(value_len, sizeof(int64_t), type);
 		FlatVector::GetDataMutable<dtime_t>(out_vec)[output_offset] = ReadTime();
 		break;
 	}
 	case LogicalTypeId::TIME_TZ: {
-		D_ASSERT(value_len == sizeof(int64_t) + sizeof(int32_t));
+		CheckValueLength(value_len, sizeof(int64_t) + sizeof(int32_t), type);
 		FlatVector::GetDataMutable<dtime_tz_t>(out_vec)[output_offset] = ReadTimeTZ();
 		break;
 	}
 	case LogicalTypeId::TIMESTAMP_TZ:
 	case LogicalTypeId::TIMESTAMP: {
-		D_ASSERT(value_len == sizeof(int64_t));
+		CheckValueLength(value_len, sizeof(int64_t), type);
 		FlatVector::GetDataMutable<timestamp_t>(out_vec)[output_offset] = ReadTimestamp();
 		break;
 	}
@@ -300,11 +403,26 @@ void PostgresBinaryParser::ReadValue(const LogicalType &type, const PostgresType
 		break;
 	}
 	case LogicalTypeId::INTERVAL: {
-		FlatVector::GetDataMutable<interval_t>(out_vec)[output_offset] = ReadInterval();
+		interval_t interval;
+		if (postgres_type.info == PostgresTypeAnnotation::INTERVAL_YEAR_TO_MONTH) {
+			CheckValueLength(value_len, sizeof(int32_t), type);
+			interval.months = ReadInteger<int32_t>();
+			interval.days = 0;
+			interval.micros = 0;
+		} else if (postgres_type.info == PostgresTypeAnnotation::INTERVAL_DAY_TO_SECOND) {
+			CheckValueLength(value_len, sizeof(int64_t), type);
+			auto micros = ReadInteger<int64_t>();
+			interval.months = 0;
+			interval.days = NumericCast<int32_t>(micros / Interval::MICROS_PER_DAY);
+			interval.micros = micros % Interval::MICROS_PER_DAY;
+		} else {
+			interval = ReadInterval();
+		}
+		FlatVector::GetDataMutable<interval_t>(out_vec)[output_offset] = interval;
 		break;
 	}
 	case LogicalTypeId::UUID: {
-		D_ASSERT(value_len == 2 * sizeof(int64_t));
+		CheckValueLength(value_len, 2 * sizeof(int64_t), type);
 		FlatVector::GetDataMutable<hugeint_t>(out_vec)[output_offset] = ReadUUID();
 		break;
 	}
@@ -329,7 +447,11 @@ void PostgresBinaryParser::ReadValue(const LogicalType &type, const PostgresType
 		default:
 			break;
 		}
-		D_ASSERT(value_len >= 3 * sizeof(uint32_t));
+		if (value_len < 3 * sizeof(uint32_t)) {
+			throw InvalidInputException(
+			    "Postgres binary reader - expected at least %llu bytes for an array header of type %s, got %d",
+			    3 * sizeof(uint32_t), type.ToString(), value_len);
+		}
 		auto array_dim = ReadInteger<uint32_t>();
 		auto array_has_null = ReadInteger<uint32_t>(); // whether or not the array has nulls - ignore
 		auto value_oid = ReadInteger<uint32_t>();      // value_oid - not necessary
@@ -363,7 +485,7 @@ void PostgresBinaryParser::ReadValue(const LogicalType &type, const PostgresType
 	case LogicalTypeId::STRUCT: {
 		auto &child_entries = StructVector::GetEntries(out_vec);
 		if (postgres_type.info == PostgresTypeAnnotation::GEOM_POINT) {
-			D_ASSERT(value_len == sizeof(double) * 2);
+			CheckValueLength(value_len, sizeof(double) * 2, type);
 			FlatVector::GetDataMutable<double>(child_entries[0])[output_offset] = ReadDouble();
 			FlatVector::GetDataMutable<double>(child_entries[1])[output_offset] = ReadDouble();
 			break;
@@ -383,6 +505,44 @@ void PostgresBinaryParser::ReadValue(const LogicalType &type, const PostgresType
 	default:
 		throw InternalException("Unsupported Type %s", type.ToString());
 	}
+}
+
+PostgresDecimalKind PostgresBinaryParser::NonFiniteDecimalKindFromSign(uint16_t dec_sign) {
+	if (dec_sign == NUMERIC_NAN) {
+		return PostgresDecimalKind::NOT_A_NUMBER;
+	}
+	if (dec_sign == NUMERIC_PINF) {
+		return PostgresDecimalKind::POSITIVE_INFINITY;
+	}
+	if (dec_sign == NUMERIC_NINF) {
+		return PostgresDecimalKind::NEGATIVE_INFINITY;
+	}
+	throw InvalidInputException("Unsupported unbound NUMERIC sign: %u", static_cast<unsigned int>(dec_sign));
+}
+
+string PostgresBinaryParser::NonFiniteDecimalKindToString(PostgresDecimalKind kind) {
+	switch (kind) {
+	case PostgresDecimalKind::NOT_A_NUMBER:
+		return "NaN";
+	case PostgresDecimalKind::POSITIVE_INFINITY:
+		return "Infinity";
+	case PostgresDecimalKind::NEGATIVE_INFINITY:
+		return "-Infinity";
+	default:
+		throw InvalidInputException("Unsupported unbound NUMERIC kind");
+	}
+}
+
+bool PostgresBinaryParser::CheckDecimalKindSetNull(Vector &out_vec, idx_t output_offset, PostgresDecimalKind dec_kind) {
+	if (dec_kind == PostgresDecimalKind::ORDINARY) {
+		return false;
+	}
+	if (!type_config.numeric_nan_as_null) {
+		string kind_str = NonFiniteDecimalKindToString(dec_kind);
+		throw InvalidInputException("Unsupported NUMERIC value: %s", kind_str);
+	}
+	FlatVector::SetNull(out_vec, output_offset, true);
+	return true;
 }
 
 } // namespace duckdb

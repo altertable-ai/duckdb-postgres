@@ -1,4 +1,6 @@
 #include "postgres_binary_file_reader.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/common/file_system.hpp"
 
 namespace duckdb {
 
@@ -12,9 +14,10 @@ static vector<column_t> MakeSequentialColumnIds(idx_t count) {
 
 PostgresBinaryFileReader::PostgresBinaryFileReader(ClientContext &context, const string &file_path,
                                                    vector<LogicalType> types_p, vector<PostgresType> postgres_types_p,
-                                                   idx_t buffer_size_p)
-    : column_ids(MakeSequentialColumnIds(types_p.size())), parser(std::move(types_p), std::move(postgres_types_p)),
-      buffer_size(buffer_size_p), file_offset(0), leftover(0), leftover_offset(0), finished(false) {
+                                                   PostgresTypeConfig type_config, idx_t buffer_size_p)
+    : column_ids(MakeSequentialColumnIds(types_p.size())),
+      parser(std::move(types_p), std::move(postgres_types_p), type_config), buffer_size(buffer_size_p), file_offset(0),
+      leftover(0), leftover_offset(0), finished(false), header_scanned(false) {
 	auto &fs = FileSystem::GetFileSystem(context);
 	file_handle = fs.OpenFile(file_path, FileFlags::FILE_FLAGS_READ);
 	file_size = file_handle->GetFileSize();
@@ -29,18 +32,18 @@ PostgresBinaryFileReader::PostgresBinaryFileReader(ClientContext &context, const
 }
 
 bool PostgresBinaryFileReader::ReadChunk(DataChunk &output) {
+	bool full = true;
 	while (output.size() < STANDARD_VECTOR_SIZE) {
 		if (parser.ReadChunk(output, column_ids)) {
-			return true;
+			break;
 		}
-		if (finished) {
-			return false;
-		}
-		if (!FillBuffer()) {
-			return false;
+		if (finished || !FillBuffer()) {
+			full = false;
+			break;
 		}
 	}
-	return true;
+	output.SetChildCardinality(output.size());
+	return full;
 }
 
 bool PostgresBinaryFileReader::FillBuffer() {
@@ -65,15 +68,25 @@ bool PostgresBinaryFileReader::FillBuffer() {
 		return false;
 	}
 
-	idx_t valid = FindLastCompleteRow(read_buffer.get(), total);
-	if (valid == 0) {
-		if (file_offset >= file_size) {
-			valid = total;
-		} else {
-			throw IOException("Postgres binary file contains a row larger than the read buffer (%llu bytes). "
-			                  "Increase buffer_size.",
-			                  buffer_size);
-		}
+	// the first buffer starts with the COPY file header, which is not a tuple - skip it while scanning for
+	// row boundaries, but keep it in the buffer so that CheckHeader can still validate it
+	idx_t scan_offset = header_scanned ? 0 : MinValue(COPY_FILE_HEADER_SIZE, total);
+	header_scanned = true;
+
+	idx_t valid = FindLastCompleteRow(read_buffer.get() + scan_offset, total - scan_offset);
+	if (valid > 0) {
+		valid += scan_offset;
+	} else if (file_offset >= file_size) {
+		valid = total;
+	} else if (scan_offset > 0) {
+		// no complete row fits next to the header. The header is a boundary of its own, so hand the parser
+		// just the header and carry the partial row over to the next fill, where the whole buffer is
+		// available for it - a row only has to fit in buffer_size, not in buffer_size minus the header.
+		valid = scan_offset;
+	} else {
+		throw IOException("Postgres binary file contains a row larger than the read buffer (%llu bytes). "
+		                  "Increase buffer_size.",
+		                  buffer_size);
 	}
 
 	parser.SetBuffer(read_buffer.get(), valid);

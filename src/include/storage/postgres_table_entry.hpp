@@ -8,11 +8,27 @@
 
 #pragma once
 
+#include "dbconnector/attached.hpp"
+
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "postgres_utils.hpp"
 
 namespace duckdb {
+
+//! How Postgres fills in a column that is not specified in an INSERT
+enum class PostgresColumnDefault : uint8_t {
+	//! No default - the column is set to NULL
+	NONE,
+	//! DEFAULT expression, SERIAL or identity column - NULL values are replaced with the Postgres-side default
+	DEFAULT_VALUE,
+	//! Generated column - values cannot be inserted
+	GENERATED
+};
 
 struct PostgresTableInfo {
 	PostgresTableInfo() {
@@ -20,7 +36,7 @@ struct PostgresTableInfo {
 		create_info->columns.SetAllowDuplicates(true);
 	}
 	PostgresTableInfo(const string &schema, const string &table) {
-		create_info = make_uniq<CreateTableInfo>(Identifier(), Identifier(schema), Identifier(table));
+		create_info = make_uniq<CreateTableInfo>(QualifiedName(Identifier(), Identifier(schema), Identifier(table)));
 		create_info->columns.SetAllowDuplicates(true);
 	}
 	PostgresTableInfo(const SchemaCatalogEntry &schema, const string &table) {
@@ -29,13 +45,16 @@ struct PostgresTableInfo {
 	}
 
 	const string &GetTableName() const {
-		return create_info->table.GetIdentifierName();
+		return create_info->GetTableName().GetIdentifierName();
 	}
 
 	unique_ptr<CreateTableInfo> create_info;
 	vector<PostgresType> postgres_types;
 	vector<string> postgres_names;
+	vector<string> postgres_type_names;
+	vector<PostgresColumnDefault> column_defaults;
 	int64_t approx_num_pages = 0;
+	unordered_map<int64_t, idx_t> attnum_to_logical;
 };
 
 class PostgresTableEntry : public TableCatalogEntry {
@@ -44,6 +63,8 @@ public:
 	PostgresTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, PostgresTableInfo &info);
 
 public:
+	const ColumnList &GetColumns() const override;
+
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
 
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
@@ -56,6 +77,14 @@ public:
 	//! Get the copy format (text or binary) that should be used when writing data to this table
 	PostgresCopyFormat GetCopyFormat(ClientContext &context);
 
+	static dbconnector::attached::AttachedTable Lookup(ClientContext &ctx, QualifiedName name);
+
+private:
+	PostgresCopyFormat GetBinaryCopyFormatIfTypesAllow();
+
+protected:
+	ColumnList columns;
+
 public:
 	//! Postgres type annotations
 	vector<PostgresType> postgres_types;
@@ -63,6 +92,10 @@ public:
 	//! We track these separately because of case sensitivity - Postgres allows e.g. the columns "ID" and "id" together
 	//! We would in this case remap them to "ID" and "id:1", while postgres_names store the original names
 	vector<string> postgres_names;
+	//! The (schema qualified, quoted) names of the column types within Postgres - empty if not known
+	vector<string> postgres_type_names;
+	//! How Postgres fills in each column when it is not specified in an INSERT
+	vector<PostgresColumnDefault> column_defaults;
 	//! The approximate number of pages a table consumes in Postgres
 	std::atomic<int64_t> approx_num_pages;
 };

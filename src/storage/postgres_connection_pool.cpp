@@ -1,31 +1,22 @@
 #include "storage/postgres_connection_pool.hpp"
 
+#include <memory>
 #include <thread>
+
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/function/table_function.hpp"
+
+#include "dbconnector/functions/configure_pool.hpp"
 
 #include "storage/postgres_catalog.hpp"
 
 namespace duckdb {
 
-static dbconnector::pool::ConnectionPoolConfig CreateConfig(ClientContext &context);
-
-static std::string GetHealthCheckQueryFromConfig(ClientContext &context) {
-	Value val;
-	if (context.TryGetCurrentSetting("pg_pool_health_check_query", val)) {
-		if (val.IsNull()) {
-			return std::string();
-		}
-		return StringValue::Get(val);
-	}
-	return PostgresConnectionPool::DefaultHealthCheckQuery();
-}
+using dbconnector::functions::ConfigurePool;
 
 PostgresConnectionPool::PostgresConnectionPool(PostgresCatalog &postgres_catalog, ClientContext &context)
-    : dbconnector::pool::ConnectionPool<PostgresConnection>(CreateConfig(context)), postgres_catalog(postgres_catalog),
-      health_check_query(GetHealthCheckQueryFromConfig(context)) {
-}
-
-PostgresPoolConnection PostgresConnectionPool::ForceGetConnection() {
-	return ForceAcquire();
+    : dbconnector::pool::ConnectionPool<PostgresConnection>(CreateConfig(context)), postgres_catalog(postgres_catalog) {
 }
 
 bool PostgresConnectionPool::TryGetConnection(PostgresPoolConnection &connection) {
@@ -35,10 +26,6 @@ bool PostgresConnectionPool::TryGetConnection(PostgresPoolConnection &connection
 	}
 	connection = std::move(acquired);
 	return true;
-}
-
-PostgresPoolConnection PostgresConnectionPool::GetConnection() {
-	return Acquire();
 }
 
 std::unique_ptr<PostgresConnection> PostgresConnectionPool::CreateNewConnection() {
@@ -59,21 +46,7 @@ void PostgresConnectionPool::ResetConnection(PostgresConnection &conn) {
 	conn.Reset(query);
 }
 
-std::string PostgresConnectionPool::GetHealthCheckQuery() {
-	std::lock_guard<std::mutex> guard(config_mutex);
-	return std::string(health_check_query.data(), health_check_query.length());
-}
-
-void PostgresConnectionPool::SetHealthCheckQuery(const std::string &query) {
-	std::lock_guard<std::mutex> guard(config_mutex);
-	this->health_check_query = std::string(query.data(), query.length());
-}
-
-std::string PostgresConnectionPool::DefaultHealthCheckQuery() {
-	return "SELECT 1";
-}
-
-static dbconnector::pool::ConnectionPoolConfig CreateConfig(ClientContext &ctx) {
+dbconnector::pool::ConnectionPoolConfig PostgresConnectionPool::CreateConfig(ClientContext &ctx) {
 	dbconnector::pool::ConnectionPoolConfig config;
 
 	{
@@ -118,6 +91,12 @@ static dbconnector::pool::ConnectionPoolConfig CreateConfig(ClientContext &ctx) 
 			config.start_reaper_thread = BooleanValue::Get(val);
 		}
 	}
+	{
+		Value val;
+		if (ctx.TryGetCurrentSetting("pg_pool_health_check_query", val) && !val.IsNull()) {
+			config.health_check_query = StringValue::Get(val);
+		}
+	}
 
 	return config;
 }
@@ -139,6 +118,24 @@ void PostgresConnectionPool::ValidatePoolAcquireMode(ClientContext &context, Set
 			}
 		}
 	}
+}
+
+static shared_ptr<PostgresConnectionPool> GetConnnectionPoolFromCatalog(Catalog &catalog) {
+	if (catalog.GetCatalogType() != "postgres") {
+		return nullptr;
+	}
+	return catalog.Cast<PostgresCatalog>().GetConnectionPoolPtr();
+}
+
+PostgresConfigurePoolFunction::PostgresConfigurePoolFunction()
+    : TableFunction("postgres_configure_pool", std::vector<LogicalType>(),
+                    ConfigurePool::Function<PostgresConnection, GetConnnectionPoolFromCatalog>, ConfigurePool::Bind,
+                    ConfigurePool::InitGlobalState, ConfigurePool::InitLocalState) {
+	GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		for (auto &en : ConfigurePool::NamedParameters()) {
+			options.Add(en.first, en.second);
+		}
+	});
 }
 
 } // namespace duckdb

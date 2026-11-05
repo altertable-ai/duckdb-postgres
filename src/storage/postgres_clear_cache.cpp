@@ -1,4 +1,5 @@
 #include "duckdb.hpp"
+#include "duckdb/main/client_context.hpp"
 
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "postgres_scanner.hpp"
@@ -13,7 +14,7 @@ struct ClearCacheFunctionData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> ClearCacheBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<ClearCacheFunctionData>();
 	return_types.push_back(LogicalType::BOOLEAN);
 	names.emplace_back("Success");
@@ -46,6 +47,6 @@ void PostgresClearCacheFunction::ClearCacheOnSetting(ClientContext &context, Set
 }
 
 PostgresClearCacheFunction::PostgresClearCacheFunction()
-    : TableFunction("pg_clear_cache", {}, ClearCacheFunction, ClearCacheBind) {
+    : TableFunction("postgres_clear_cache", {}, ClearCacheFunction, ClearCacheBind) {
 }
 } // namespace duckdb

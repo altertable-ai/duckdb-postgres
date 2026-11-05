@@ -5,21 +5,24 @@ add_subdirectory(storage)
 
 add_library(
   postgres_ext_library OBJECT
-  postgres_attach.cpp
   postgres_aws.cpp
   postgres_binary_copy.cpp
   postgres_binary_file_reader.cpp
   postgres_binary_parser.cpp
   postgres_binary_reader.cpp
+  postgres_connection_string.cpp
   postgres_connection.cpp
   postgres_copy_from.cpp
   postgres_copy_to.cpp
-  postgres_execute.cpp
   postgres_extension.cpp
   postgres_filter_pushdown.cpp
   postgres_hstore.cpp
   postgres_parameters.cpp
+  postgres_pin_connection.cpp
+  postgres_prepared_statement.cpp
   postgres_query.cpp
+  postgres_sql_writer.cpp
+  postgres_result_reader.cpp
   postgres_scanner.cpp
   postgres_secrets.cpp
   postgres_storage.cpp

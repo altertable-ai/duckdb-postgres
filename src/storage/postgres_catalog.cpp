@@ -1,32 +1,381 @@
 #include "storage/postgres_catalog.hpp"
-#include "storage/postgres_schema_entry.hpp"
-#include "storage/postgres_transaction.hpp"
-#include "postgres_oauth.hpp"
-#include "postgres_connection.hpp"
-#include "postgres_secrets.hpp"
-#include "storage/postgres_secret_storage.hpp"
-#include "postgres_utils.hpp"
+
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/storage/database_size.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/expression/conjunction_expression.hpp"
+#include "duckdb/parser/expression/operator_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/expression/type_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/query_node/delete_query_node.hpp"
+#include "duckdb/parser/query_node/insert_query_node.hpp"
+#include "duckdb/parser/query_node/merge_query_node.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/update_query_node.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 
+#include "postgres_connection_string.hpp"
+#include "postgres_connection.hpp"
+#include "postgres_oauth.hpp"
+#include "postgres_secrets.hpp"
+#include "postgres_sql_writer.hpp"
+#include "postgres_utils.hpp"
+#include "storage/postgres_schema_entry.hpp"
+#include "storage/postgres_transaction.hpp"
+#include "storage/postgres_secret_storage.hpp"
+
 namespace duckdb {
+
+void PostgresCatalog::InitializeRemotePushdown(ClientContext &context, PostgresConnection &connection) {
+	Value enabled_val;
+	if (context.TryGetCurrentSetting("pg_enable_remote_pushdown", enabled_val) && !enabled_val.IsNull()) {
+		remote_pushdown_enabled = BooleanValue::Get(enabled_val);
+	}
+	if (!remote_pushdown_enabled || version.type_v == PostgresInstanceType::REDSHIFT) {
+		remote_pushdown_enabled = false;
+		return;
+	}
+	// plain table scans are only executed locally when they can be parallelized - this mirrors the conditions of
+	// PostgresScanFunction::PrepareBind
+	Value ctid_scan_val;
+	bool use_ctid_scan = true;
+	if (context.TryGetCurrentSetting("pg_use_ctid_scan", ctid_scan_val) && !ctid_scan_val.IsNull()) {
+		use_ctid_scan = BooleanValue::Get(ctid_scan_val);
+	}
+	Value text_protocol_val;
+	bool text_protocol_setting = false;
+	if (context.TryGetCurrentSetting("pg_use_text_protocol", text_protocol_val) && !text_protocol_val.IsNull()) {
+		text_protocol_setting = BooleanValue::Get(text_protocol_val);
+	}
+	bool use_text_protocol = UseTextProtocol(PostgresUtils::ExtractQueryMode(context), text_protocol_setting);
+	parallel_scans_supported = use_ctid_scan && !use_text_protocol && version.major_v >= 14;
+	PostgresPushdownInfo info;
+	info.version = version;
+	info.read_only = access_mode == AccessMode::READ_ONLY;
+	// string ordering only matches DuckDB's (byte-wise) ordering with C-like collations, and case mapping only
+	// matches DuckDB's (Unicode) case mapping when the character classification is not plain ASCII
+	string provider_query = version >= PostgresVersion(15, 0) ? "datlocprovider::text" : "'c'";
+	string locale_query = version >= PostgresVersion(17, 0) ? "datlocale" : "NULL";
+	auto result = connection.TryQuery(context, "SELECT datcollate, datctype, " + provider_query + ", " + locale_query +
+	                                               ", pg_encoding_to_char(encoding), current_setting('TimeZone') "
+	                                               "FROM pg_database WHERE datname = current_database()");
+	if (result && result->Count() > 0) {
+		auto collation = result->GetString(0, 0);
+		auto ctype = result->GetString(0, 1);
+		auto provider = result->GetString(0, 2);
+		auto locale = result->IsNull(0, 3) ? string() : result->GetString(0, 3);
+		auto encoding = result->GetString(0, 4);
+		static const case_insensitive_set_t BINARY_COLLATIONS = {"C", "POSIX", "C.UTF-8", "C.UTF8"};
+		static const case_insensitive_set_t ASCII_CTYPES = {"C", "POSIX"};
+		bool utf8 = StringUtil::CIEquals(encoding, "UTF8");
+		if (provider == "b") {
+			// the builtin provider (C, C.UTF-8, PG_UNICODE_FAST) orders by code point
+			info.binary_collation = true;
+			info.unicode_case_mapping = utf8 && ASCII_CTYPES.count(locale) == 0;
+		} else if (provider == "c") {
+			info.binary_collation = BINARY_COLLATIONS.count(collation) > 0;
+			info.unicode_case_mapping = utf8 && ASCII_CTYPES.count(ctype) == 0;
+		} else {
+			// ICU
+			info.unicode_case_mapping = utf8;
+		}
+		remote_time_zone = result->GetString(0, 5);
+	}
+	capabilities = PostgresCapabilities(std::move(info));
+}
+
+template <class T>
+static bool PostgresCheckPushdown(bool enabled, PostgresCapabilities &capabilities, const T &construct,
+                                  const char *construct_name) {
+	if (!enabled) {
+		return false;
+	}
+	auto result = capabilities.SupportsPushdown(construct);
+	if (!result && PostgresConnection::DebugPrintQueries()) {
+		Printer::Print("Remote pushdown: " + string(construct_name) + " not supported: " + construct.ToString());
+	}
+	return result;
+}
+
+bool PostgresCatalog::SupportsPushdown(const ParsedExpression &expression) {
+	return PostgresCheckPushdown(remote_pushdown_enabled, capabilities, expression, "expression");
+}
+
+bool PostgresCatalog::SupportsPushdown(const TableRef &ref) {
+	return PostgresCheckPushdown(remote_pushdown_enabled, capabilities, ref, "table reference");
+}
+
+bool PostgresCatalog::SupportsPushdown(const QueryNode &node) {
+	return PostgresCheckPushdown(remote_pushdown_enabled, capabilities, node, "query");
+}
+
+bool PostgresCatalog::SupportsPushdown(const SQLStatement &statement) {
+	return PostgresCheckPushdown(remote_pushdown_enabled, capabilities, statement, "statement");
+}
+
+vector<string> PostgresCatalog::GetRemotePushdownPreliminaryQueries(ClientContext &context, bool requires_time_zone) {
+	vector<string> result;
+	Value time_zone_val;
+	if (requires_time_zone && context.TryGetCurrentSetting("TimeZone", time_zone_val) && !time_zone_val.IsNull()) {
+		auto time_zone = time_zone_val.ToString();
+		if (!time_zone.empty()) {
+			// time zone dependent operations (e.g. extracting date parts from a TIMESTAMP WITH TIME ZONE)
+			// must use DuckDB's time zone, the setting is reverted at the end of the transaction
+			result.push_back("SET LOCAL TimeZone = " + PostgresUtils::WriteLiteral(time_zone));
+		}
+	}
+	return result;
+}
+
+static bool PostgresIsSimpleFilter(const ParsedExpression &expr) {
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::CONJUNCTION:
+		for (auto &child : expr.Cast<ConjunctionExpression>().GetChildren()) {
+			if (!PostgresIsSimpleFilter(*child)) {
+				return false;
+			}
+		}
+		return true;
+	case ExpressionClass::COMPARISON: {
+		auto &comparison = expr.Cast<ComparisonExpression>();
+		auto left_class = comparison.Left().GetExpressionClass();
+		auto right_class = comparison.Right().GetExpressionClass();
+		return (left_class == ExpressionClass::COLUMN_REF && right_class == ExpressionClass::CONSTANT) ||
+		       (left_class == ExpressionClass::CONSTANT && right_class == ExpressionClass::COLUMN_REF);
+	}
+	case ExpressionClass::OPERATOR: {
+		auto &children = expr.Cast<OperatorExpression>().GetChildren();
+		switch (expr.GetExpressionType()) {
+		case ExpressionType::OPERATOR_IS_NULL:
+		case ExpressionType::OPERATOR_IS_NOT_NULL:
+			return children[0]->GetExpressionClass() == ExpressionClass::COLUMN_REF;
+		case ExpressionType::COMPARE_IN:
+			if (children[0]->GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+				return false;
+			}
+			for (idx_t i = 1; i < children.size(); i++) {
+				if (children[i]->GetExpressionClass() != ExpressionClass::CONSTANT) {
+					return false;
+				}
+			}
+			return true;
+		default:
+			return false;
+		}
+	}
+	default:
+		return false;
+	}
+}
+
+//! Whether a query is a plain scan of a single table - when parallel scans are possible, those are executed through
+//! a regular (parallel) table scan, which pushes down projections and simple filters as well
+static bool PostgresIsTrivialQuery(const QueryNode &node, const identifier_set_t &cte_names) {
+	if (node.type != QueryNodeType::SELECT_NODE || !node.cte_map.map.empty()) {
+		return false;
+	}
+	for (auto &modifier : node.modifiers) {
+		// a LIMIT is pushed into the table scan as well
+		if (modifier->type != ResultModifierType::LIMIT_MODIFIER || modifier->Cast<LimitModifier>().offset) {
+			return false;
+		}
+	}
+	auto &select = node.Cast<SelectNode>();
+	if (!select.from_table || select.from_table->type != TableReferenceType::BASE_TABLE ||
+	    !select.groups.grouping_sets.empty() || select.having || select.qualify || select.sample ||
+	    select.aggregate_handling != AggregateHandling::STANDARD_HANDLING) {
+		return false;
+	}
+	auto &base = select.from_table->Cast<BaseTableRef>();
+	if (base.sample || cte_names.count(base.Table()) > 0) {
+		return false;
+	}
+	for (auto &expr : select.select_list) {
+		auto expr_class = expr->GetExpressionClass();
+		if (expr_class != ExpressionClass::COLUMN_REF && expr_class != ExpressionClass::STAR) {
+			return false;
+		}
+	}
+	return !select.where_clause || PostgresIsSimpleFilter(*select.where_clause);
+}
+
+static bool PostgresIsDMLWithoutReturning(const QueryNode &node) {
+	switch (node.type) {
+	case QueryNodeType::UPDATE_QUERY_NODE:
+		return node.Cast<UpdateQueryNode>().returning_list.empty();
+	case QueryNodeType::DELETE_QUERY_NODE:
+		return node.Cast<DeleteQueryNode>().returning_list.empty();
+	case QueryNodeType::INSERT_QUERY_NODE:
+		return node.Cast<InsertQueryNode>().returning_list.empty();
+	case QueryNodeType::MERGE_QUERY_NODE:
+		return node.Cast<MergeQueryNode>().returning_list.empty();
+	default:
+		return false;
+	}
+}
+
+static unique_ptr<TableRef> PostgresExecuteLocally(unique_ptr<QueryNode> node) {
+	auto select = make_uniq<SelectStatement>();
+	select->node = std::move(node);
+	return make_uniq<SubqueryRef>(std::move(select));
+}
+
+unique_ptr<TableRef> PostgresCatalog::RemoteExecute(ClientContext &context, unique_ptr<QueryNode> node) {
+	// bind the query locally to figure out the result types and names DuckDB would produce
+	identifier_set_t cte_names;
+	PostgresSQLWriter::CollectCTENames(*node, cte_names);
+	auto local_node = node->Copy();
+	PostgresSQLWriter::QualifyTables(*local_node, GetName(), cte_names);
+	if (parallel_scans_supported && PostgresIsTrivialQuery(*node, cte_names)) {
+		return PostgresExecuteLocally(std::move(local_node));
+	}
+	BoundStatement bound;
+	try {
+		auto bind_node = local_node->Copy();
+		auto binder = Binder::CreateBinder(context);
+		bound = binder->Bind(*bind_node);
+	} catch (std::exception &ex) {
+		// the query cannot be bound - execute it locally so that DuckDB reports the error
+		if (PostgresConnection::DebugPrintQueries()) {
+			Printer::Print("Remote pushdown: executing locally, the query cannot be bound: " + string(ex.what()));
+		}
+		return PostgresExecuteLocally(std::move(local_node));
+	}
+
+	PostgresWriterResult query;
+	try {
+		query = PostgresSQLWriter::WriteQuery(context, *this, *node, &bound.types);
+	} catch (PostgresPushdownNotSupported &ex) {
+		// the query contains a construct that cannot be translated for the types it operates on
+		if (PostgresConnection::DebugPrintQueries()) {
+			Printer::Print("Remote pushdown: executing locally, " + string(ex.what()));
+		}
+		return PostgresExecuteLocally(std::move(local_node));
+	}
+	auto preliminary_queries = GetRemotePushdownPreliminaryQueries(context, query.requires_time_zone);
+	for (auto &preliminary_query : query.preliminary_queries) {
+		preliminary_queries.push_back(std::move(preliminary_query));
+	}
+	vector<unique_ptr<ParsedExpression>> args;
+	args.push_back(ConstantExpression::FromValue(Value(GetName())));
+	args.push_back(ConstantExpression::FromValue(Value(query.sql)));
+	if (!preliminary_queries.empty()) {
+		vector<Value> preliminary_values;
+		for (auto &preliminary_query : preliminary_queries) {
+			preliminary_values.emplace_back(preliminary_query);
+		}
+		args.push_back(make_uniq<ComparisonExpression>(
+		    ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>("preliminary_queries"),
+		    ConstantExpression::FromValue(Value::LIST(LogicalType::VARCHAR, std::move(preliminary_values)))));
+	}
+	if (PostgresIsDMLWithoutReturning(*node)) {
+		// the statement yields the number of changed rows
+		args.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+		                                               make_uniq<ColumnRefExpression>("return_changed_rows"),
+		                                               ConstantExpression::FromValue(Value::BOOLEAN(true))));
+	}
+	auto func_ref = make_uniq<TableFunctionRef>();
+	func_ref->function = make_uniq<FunctionExpression>("postgres_query", std::move(args));
+	func_ref->alias = Identifier("postgres_query");
+
+	// convert the result to the exact types and names DuckDB would produce
+	auto select_node = make_uniq<SelectNode>();
+	for (idx_t i = 0; i < bound.types.size(); i++) {
+		auto column_name = Identifier("c" + to_string(i));
+		func_ref->column_name_alias.push_back(column_name);
+		unique_ptr<ParsedExpression> expr = make_uniq<ColumnRefExpression>(column_name, Identifier("postgres_query"));
+		if (TypeExpression::CanRepresent(bound.types[i])) {
+			expr = make_uniq<CastExpression>(bound.types[i], std::move(expr));
+		}
+		expr->SetAlias(bound.names[i]);
+		select_node->select_list.push_back(std::move(expr));
+	}
+	select_node->from_table = std::move(func_ref);
+	auto select = make_uniq<SelectStatement>();
+	select->node = std::move(select_node);
+	return make_uniq<SubqueryRef>(std::move(select));
+}
+
+unique_ptr<TableRef> PostgresCatalog::RemoteExecute(ClientContext &context, unique_ptr<SQLStatement> statement) {
+	PostgresWriterResult query;
+	try {
+		query = PostgresSQLWriter::WriteStatement(context, *this, *statement);
+	} catch (PostgresPushdownNotSupported &ex) {
+		// statements cannot be executed locally instead
+		throw NotImplementedException("The statement cannot be executed in Postgres (%s) - use \"SET "
+		                              "pg_enable_remote_pushdown = false\" before attaching the database to execute "
+		                              "it without remote pushdown",
+		                              ex.what());
+	}
+	auto preliminary_queries = GetRemotePushdownPreliminaryQueries(context, query.requires_time_zone);
+	for (auto &preliminary_query : query.preliminary_queries) {
+		preliminary_queries.push_back(std::move(preliminary_query));
+	}
+	vector<unique_ptr<ParsedExpression>> args;
+	args.push_back(ConstantExpression::FromValue(Value(GetName())));
+	args.push_back(ConstantExpression::FromValue(Value(query.sql)));
+	auto named_parameter = [&](const char *name, Value value) {
+		args.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+		                                               make_uniq<ColumnRefExpression>(name),
+		                                               ConstantExpression::FromValue(std::move(value))));
+	};
+	if (!preliminary_queries.empty()) {
+		vector<Value> preliminary_values;
+		for (auto &preliminary_query : preliminary_queries) {
+			preliminary_values.emplace_back(preliminary_query);
+		}
+		named_parameter("preliminary_queries", Value::LIST(LogicalType::VARCHAR, std::move(preliminary_values)));
+	}
+	// the statement can depend on the preliminary queries (e.g. INSERT into a table that is created by them)
+	named_parameter("prepare", Value::BOOLEAN(false));
+	// remove the catalog entries that are modified by the statement from the cache
+	for (auto &invalidation : query.invalidations) {
+		InvalidateCacheEntry(context, invalidation);
+	}
+	if (query.changed_rows) {
+		named_parameter("return_changed_rows", Value::BOOLEAN(true));
+	} else {
+		named_parameter("suppress_dml_output", Value::BOOLEAN(true));
+	}
+	auto func_ref = make_uniq<TableFunctionRef>();
+	func_ref->function = make_uniq<FunctionExpression>("postgres_query", std::move(args));
+	return std::move(func_ref);
+}
 
 unique_ptr<TableRef> PostgresCatalog::RemoteExecute(ClientContext &context, const string &sql) {
 	vector<unique_ptr<ParsedExpression>> args;
-	args.push_back(make_uniq<ConstantExpression>(Value(GetName())));
-	args.push_back(make_uniq<ConstantExpression>(Value(sql)));
+	args.push_back(ConstantExpression::FromValue(Value(GetName())));
+	args.push_back(ConstantExpression::FromValue(Value(sql)));
+	args.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+	                                               make_uniq<ColumnRefExpression>("suppress_dml_output"),
+	                                               ConstantExpression::FromValue(Value::BOOLEAN(true))));
 	auto func_ref = make_uniq<TableFunctionRef>();
 	func_ref->function = make_uniq<FunctionExpression>("postgres_query", std::move(args));
 	return func_ref;
 }
 
 string PostgresCatalog::GetConnectDisplay() {
+	if (!connect_display.empty()) {
+		// an explicit display string was provided in the ATTACH - this is used by extensions that attach
+		// Postgres compatible databases (such as AWS RDS or Redshift) through this extension, so that the
+		// prompt can show how the database was attached instead of the Postgres connection we ended up with
+		return connect_display;
+	}
 	// `postgres://<host>[:<port>]` — standard postgres URI shorthand. dbname is already shown
 	// via current_database in the prompt, so it's omitted here.
 	string host, port;
@@ -68,13 +417,17 @@ unique_ptr<SecretEntry> GetSecret(ClientContext &context, const string &secret_n
 }
 
 PostgresCatalog::PostgresCatalog(ClientContext &ctx, AttachedDatabase &db_p, string attach_path_p,
-                                 AccessMode access_mode, string schema_to_load, PostgresIsolationLevel isolation_level,
-                                 const string &secret_name, SecretStorageTable secret_storage_table_p)
+                                 AccessMode access_mode, vector<string> schemas_to_load,
+                                 PostgresIsolationLevel isolation_level, const string &secret_name,
+                                 SecretStorageTable secret_storage_table_p, PostgresTextProtocolMode text_protocol_mode,
+                                 string connect_display_p)
     : Catalog(db_p), attach_path(std::move(attach_path_p)), access_mode(access_mode), isolation_level(isolation_level),
-      schemas(*this, schema_to_load), connection_pool(make_shared_ptr<PostgresConnectionPool>(*this, ctx)),
-      default_schema(schema_to_load), secret_storage_table(std::move(secret_storage_table_p)) {
+      text_protocol_mode(text_protocol_mode), schemas(*this, schemas_to_load),
+      connection_pool(make_shared_ptr<PostgresConnectionPool>(*this, ctx)),
+      default_schema(schemas_to_load.size() > 0 ? Identifier(schemas_to_load[0]) : Identifier()),
+      secret_storage_table(std::move(secret_storage_table_p)), connect_display(std::move(connect_display_p)) {
 	auto secret_entry = GetSecretEntry(ctx, secret_name);
-	this->rds_token_config = PostgresAws::ExtractTokenConfigFromSecret(secret_entry);
+	this->rds_token_config = PostgresAws::ExtractTokenConfigFromSecret(ctx, secret_entry);
 	if (!rds_token_config.Enabled()) {
 		this->connection_string = CreateConnectionString(secret_entry, attach_path);
 	}
@@ -86,9 +439,10 @@ PostgresCatalog::PostgresCatalog(ClientContext &ctx, AttachedDatabase &db_p, str
 	PostgresPoolConnection connection;
 	{
 		auto oauth_token_holder = SetThreadLocalOAuthTokenFromSessionOption(ctx);
-		connection = connection_pool->GetConnection();
+		connection = connection_pool->Acquire();
 	}
 	this->version = connection.GetConnection().GetPostgresVersion(ctx);
+	InitializeRemotePushdown(ctx, connection.GetConnection());
 }
 
 unique_ptr<SecretEntry> PostgresCatalog::GetSecretEntry(ClientContext &ctx, const std::string &secret_name) {
@@ -109,6 +463,9 @@ unique_ptr<SecretEntry> PostgresCatalog::GetSecretEntry(ClientContext &ctx, cons
 
 string PostgresCatalog::CreateConnectionString(optional_ptr<SecretEntry> secret_entry, const string &attach_path) {
 	string connection_string = attach_path;
+	bool user_specified_app_name = PostgresConnectionString::ContainsApplicationName(connection_string);
+	bool secret_has_app_name = false;
+	string secret_connection_info;
 	if (secret_entry) {
 		// secret found - read data
 		const auto &kv_secret = dynamic_cast<const KeyValueSecret &>(*secret_entry->secret);
@@ -128,15 +485,35 @@ string PostgresCatalog::CreateConnectionString(optional_ptr<SecretEntry> secret_
 				throw BinderException("ATTACH path must be empty when 'URI' option is specified, was: \"%s\"",
 				                      attach_path);
 			}
-			return uri_val.ToString();
+			string uri = uri_val.ToString();
+			bool uri_has_app_name = PostgresConnectionString::ContainsApplicationName(uri);
+			if (!uri_has_app_name) {
+				PostgresConnectionString::AppendDefaultApplicationName(uri, PostgresConnectionStringFormat::URI);
+			}
+			return uri;
 		}
 
-		string new_connection_info;
+		secret_has_app_name = !kv_secret.TryGetValue("application_name").IsNull() ||
+		                      !kv_secret.TryGetValue("fallback_application_name").IsNull();
+
 		for (const string &opt_name : PostgresSecrets::ConnectionOptionNames()) {
-			new_connection_info += PostgresUtils::ExtractConnectionOption(kv_secret, opt_name);
+			secret_connection_info += PostgresConnectionString::ExtractOption(kv_secret, opt_name);
 		}
-		connection_string = new_connection_info + connection_string;
 	}
+
+	if (!(user_specified_app_name || secret_has_app_name)) {
+		if (PostgresConnectionString::IsURI(connection_string)) {
+			// libpq cannot read key/value pairs in front of a URI, so the name goes into the URI
+			PostgresConnectionString::AppendDefaultApplicationName(connection_string,
+			                                                       PostgresConnectionStringFormat::URI);
+		} else {
+			PostgresConnectionString::AppendDefaultApplicationName(secret_connection_info,
+			                                                       PostgresConnectionStringFormat::KEY_VALUE);
+			secret_connection_info.push_back(' ');
+		}
+	}
+	connection_string = secret_connection_info + connection_string;
+
 	return connection_string;
 }
 
@@ -161,7 +538,7 @@ string PostgresCatalog::GetConnectionString() {
 		this->rds_token = PostgresAws::GenerateRdsAuthToken(GetAttached(), rds_token_config);
 		this->rds_token_last_refreshed = now;
 		this->connection_string = rds_token_config.base_connection_string +
-		                          "password=" + PostgresUtils::EscapeConnectionString(rds_token) + " " + attach_path;
+		                          "password=" + PostgresConnectionString::Escape(rds_token) + " " + attach_path;
 	}
 	return std::string(connection_string.data(), connection_string.length());
 }
@@ -175,13 +552,14 @@ void PostgresCatalog::Initialize(bool load_builtin) {
 
 optional_ptr<CatalogEntry> PostgresCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
 	auto &postgres_transaction = PostgresTransaction::Get(transaction.GetContext(), *this);
-	auto entry = schemas.GetEntry(transaction.GetContext(), postgres_transaction, info.schema.GetIdentifierName());
+	auto entry = schemas.GetEntry(transaction.GetContext(), postgres_transaction,
+	                              info.GetQualifiedName().Schema().GetIdentifierName());
 	if (entry) {
 		switch (info.on_conflict) {
 		case OnCreateConflict::REPLACE_ON_CONFLICT: {
 			DropInfo try_drop;
 			try_drop.type = CatalogType::SCHEMA_ENTRY;
-			try_drop.name = info.schema;
+			try_drop.SetName(info.GetQualifiedName().Schema());
 			try_drop.if_not_found = OnEntryNotFound::RETURN_NULL;
 			try_drop.cascade = false;
 			schemas.DropEntry(postgres_transaction, try_drop);
@@ -191,7 +569,8 @@ optional_ptr<CatalogEntry> PostgresCatalog::CreateSchema(CatalogTransaction tran
 			return entry;
 		case OnCreateConflict::ERROR_ON_CONFLICT:
 		default:
-			throw BinderException("Failed to create schema \"%s\": schema already exists", info.schema);
+			throw BinderException("Failed to create schema \"%s\": schema already exists",
+			                      info.GetQualifiedName().Schema());
 		}
 	}
 	return schemas.CreateSchema(postgres_transaction, info);
@@ -217,6 +596,11 @@ optional_ptr<SchemaCatalogEntry> PostgresCatalog::LookupSchema(CatalogTransactio
 		schema_name = postgres_transaction.GetTemporarySchema();
 	}
 	auto entry = schemas.GetEntry(transaction.GetContext(), postgres_transaction, schema_name);
+	if (!entry && schema_name == DEFAULT_SCHEMA) {
+		// DuckDB's default schema name - resolve it to the default schema of the Postgres database,
+		// unless a schema with that name exists in Postgres
+		entry = schemas.GetEntry(transaction.GetContext(), postgres_transaction, default_schema.GetIdentifierName());
+	}
 	if (!entry && if_not_found != OnEntryNotFound::RETURN_NULL) {
 		throw BinderException("Schema with name \"%s\" not found", schema_name);
 	}
@@ -244,6 +628,24 @@ DatabaseSize PostgresCatalog::GetDatabaseSize(ClientContext &context) {
 	return size;
 }
 
+void PostgresCatalog::InvalidateCacheEntry(ClientContext &context, const PostgresCacheInvalidation &invalidation) {
+	auto &transaction = PostgresTransaction::Get(context, *this);
+	if (invalidation.type == CatalogType::SCHEMA_ENTRY) {
+		schemas.InvalidateEntry(invalidation.name);
+		return;
+	}
+	auto schema = schemas.GetEntry(context, transaction, invalidation.schema);
+	if (!schema) {
+		return;
+	}
+	auto &postgres_schema = schema->Cast<PostgresSchemaEntry>();
+	if (invalidation.all_tables) {
+		postgres_schema.InvalidateTables();
+	} else {
+		postgres_schema.InvalidateEntry(invalidation.type, invalidation.name);
+	}
+}
+
 void PostgresCatalog::ClearCache() {
 	schemas.ClearEntries();
 }
@@ -256,7 +658,7 @@ void PostgresCatalog::RegisterSecretStorage() {
 	}
 
 	// Look up whether the table exists in DB
-	auto connection = connection_pool->GetConnection();
+	auto connection = connection_pool->Acquire();
 	bool secret_storage_table_exists = secret_storage_table.Exists(connection.GetConnection());
 
 	string attached_database_name = GetAttached().GetName().GetIdentifierName();
@@ -303,6 +705,46 @@ void PostgresCatalog::RegisterSecretStorage() {
 			// Some other error has happened
 			throw;
 		}
+	}
+}
+
+dbconnector::attached::AttachedCatalog PostgresCatalog::Lookup(ClientContext &ctx, const Identifier &name) {
+	using namespace dbconnector::attached;
+
+	AttachedCatalog attached_catalog = AttachedCatalog::Lookup(ctx, "postgres", name);
+	if (!attached_catalog) {
+		throw InvalidInputException("Attached PostgreSQL database not found in the specified client session, name: %s",
+		                            name);
+	}
+	return attached_catalog;
+}
+//! Resolve whether scans against this database must use the text protocol instead of the binary COPY
+//! protocol. This is the single place where that decision is made for an attached database, so every
+//! scan path (table scans, postgres_query/CONNECT, ...) agrees.
+bool PostgresCatalog::UseBinaryPlainQueryWithTextFallback(PostgresQueryMode query_mode,
+                                                          bool use_text_protocol_setting) const {
+	return query_mode == PostgresQueryMode::AUTO && text_protocol_mode == PostgresTextProtocolMode::AUTO &&
+	       !use_text_protocol_setting && version.type_v == PostgresInstanceType::REDSHIFT;
+}
+
+bool PostgresCatalog::UseTextProtocol(PostgresQueryMode query_mode, bool use_text_protocol_setting) const {
+	switch (query_mode) {
+	case PostgresQueryMode::COPY_BINARY:
+	case PostgresQueryMode::PLAIN_QUERY_BINARY:
+		return false;
+	case PostgresQueryMode::PLAIN_QUERY_TEXT:
+		return true;
+	default: {
+		switch (text_protocol_mode) {
+		case PostgresTextProtocolMode::TEXT:
+			return true;
+		case PostgresTextProtocolMode::BINARY:
+			return false;
+		default:
+			// Redshift does not support the binary COPY protocol
+			return use_text_protocol_setting || version.type_v == PostgresInstanceType::REDSHIFT;
+		}
+	}
 	}
 }
 

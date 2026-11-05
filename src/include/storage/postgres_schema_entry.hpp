@@ -9,6 +9,10 @@
 #pragma once
 
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "storage/postgres_table_set.hpp"
 #include "storage/postgres_index_set.hpp"
 #include "storage/postgres_type_set.hpp"
@@ -45,6 +49,11 @@ public:
 	optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction transaction, const EntryLookupInfo &lookup_info) override;
 
 	static bool SchemaIsInternal(const string &name);
+
+	//! Remove an entry from the cache - after it was modified by a statement that was executed in Postgres
+	void InvalidateEntry(CatalogType type, const string &name);
+	//! Remove all tables from the cache
+	void InvalidateTables();
 
 private:
 	void AlterTable(PostgresTransaction &transaction, RenameTableInfo &info);

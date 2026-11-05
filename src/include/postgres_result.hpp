@@ -48,10 +48,14 @@ public:
 		D_ASSERT(res);
 		return PQntuples(res);
 	}
-	idx_t AffectedRows() {
-		auto affected = PQcmdTuples(res);
-		if (!affected) {
-			throw InternalException("Postgres scanner - AffectedRows called but none were available");
+	idx_t ColumnCount() {
+		D_ASSERT(res);
+		return PQnfields(res);
+	}
+	int64_t AffectedRows() {
+		char *affected = PQcmdTuples(res);
+		if (!affected || strlen(affected) == 0) {
+			return -1;
 		}
 		return atoll(affected);
 	}

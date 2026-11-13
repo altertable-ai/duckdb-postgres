@@ -72,6 +72,11 @@ public:
 		return planner.Make<PostgresCreateIndex>(std::move(info), table);
 	}
 
+	// Optimizer hooks of other extensions call this on every extension operator; the default throws.
+	string GetExtensionName() const override {
+		return "postgres_scanner";
+	}
+
 	void Serialize(Serializer &serializer) const override {
 		throw NotImplementedException("Cannot serialize Postgres Create index");
 	}

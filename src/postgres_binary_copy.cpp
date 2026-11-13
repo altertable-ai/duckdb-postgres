@@ -1,4 +1,5 @@
 #include "postgres_binary_copy.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "postgres_binary_writer.hpp"
 #include "postgres_binary_file_reader.hpp"
 #include "duckdb/common/serializer/buffered_file_writer.hpp"
@@ -97,7 +98,7 @@ void PostgresBinaryCopyFunction::PostgresBinaryWriteFinalize(ClientContext &cont
 
 struct PostgresBinaryReadBindData : public TableFunctionData {
 	string file_path;
-	vector<string> names;
+	vector<Identifier> names;
 	vector<LogicalType> types;
 	vector<PostgresType> postgres_types;
 	idx_t buffer_size = PostgresBinaryFileReader::DEFAULT_BUFFER_SIZE;
@@ -124,7 +125,7 @@ struct PostgresBinaryReadGlobalState : public GlobalTableFunctionState {
 
 unique_ptr<FunctionData> PostgresBinaryCopyFunction::PostgresBinaryReadBind(ClientContext &context,
                                                                             CopyFromFunctionBindInput &info,
-                                                                            vector<string> &expected_names,
+                                                                            vector<Identifier> &expected_names,
                                                                             vector<LogicalType> &expected_types) {
 	auto result = make_uniq<PostgresBinaryReadBindData>();
 	result->file_path = info.info.file_path;
@@ -140,8 +141,9 @@ static unique_ptr<GlobalTableFunctionState> PostgresBinaryReadInitGlobal(ClientC
                                                                          TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<PostgresBinaryReadBindData>();
 	auto result = make_uniq<PostgresBinaryReadGlobalState>();
+	PostgresTypeConfig type_config = PostgresTypeConfig::FromContext(context);
 	result->reader = make_uniq<PostgresBinaryFileReader>(context, bind_data.file_path, bind_data.types,
-	                                                     bind_data.postgres_types, bind_data.buffer_size);
+	                                                     bind_data.postgres_types, type_config, bind_data.buffer_size);
 	return std::move(result);
 }
 
@@ -156,11 +158,11 @@ static void PostgresBinaryReadScan(ClientContext &context, TableFunctionInput &d
 }
 
 static unique_ptr<FunctionData> ReadPostgresBinaryBind(ClientContext &context, TableFunctionBindInput &input,
-                                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<PostgresBinaryReadBindData>();
 	result->file_path = input.inputs[0].GetValue<string>();
 
-	if (!input.named_parameters.count("columns")) {
+	if (!input.named_parameters.contains("columns")) {
 		throw BinderException("read_postgres_binary requires a 'columns' parameter, "
 		                      "e.g. columns={col1: 'INTEGER', col2: 'VARCHAR'}");
 	}
@@ -172,7 +174,7 @@ static unique_ptr<FunctionData> ReadPostgresBinaryBind(ClientContext &context, T
 		auto col_type_str = column_map[i].GetValue<string>();
 		auto col_type = TransformStringToLogicalType(col_type_str, context);
 
-		names.push_back(col_name.GetIdentifierName());
+		names.push_back(col_name);
 		return_types.push_back(col_type);
 		result->postgres_types.push_back(PostgresUtils::CreateEmptyPostgresType(col_type));
 	}
@@ -180,7 +182,7 @@ static unique_ptr<FunctionData> ReadPostgresBinaryBind(ClientContext &context, T
 	result->names = names;
 	result->types = return_types;
 
-	if (input.named_parameters.count("buffer_size")) {
+	if (input.named_parameters.contains("buffer_size")) {
 		result->buffer_size = input.named_parameters.at("buffer_size").GetValue<uint64_t>();
 	}
 
@@ -188,7 +190,7 @@ static unique_ptr<FunctionData> ReadPostgresBinaryBind(ClientContext &context, T
 }
 
 static void PostgresBinaryReadSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
-                                        const TableFunction &function) {
+                                        const BoundTableFunction &function) {
 	auto &bind_data = bind_data_p->Cast<PostgresBinaryReadBindData>();
 	serializer.WriteProperty(100, "file_path", bind_data.file_path);
 	serializer.WriteProperty(101, "names", bind_data.names);
@@ -196,7 +198,8 @@ static void PostgresBinaryReadSerialize(Serializer &serializer, const optional_p
 	serializer.WriteProperty(103, "buffer_size", bind_data.buffer_size);
 }
 
-static unique_ptr<FunctionData> PostgresBinaryReadDeserialize(Deserializer &deserializer, TableFunction &function) {
+static unique_ptr<FunctionData> PostgresBinaryReadDeserialize(Deserializer &deserializer,
+                                                              BoundTableFunction &function) {
 	auto result = make_uniq<PostgresBinaryReadBindData>();
 	deserializer.ReadProperty(100, "file_path", result->file_path);
 	deserializer.ReadProperty(101, "names", result->names);
@@ -220,11 +223,17 @@ PostgresBinaryCopyFunction::PostgresBinaryCopyFunction() : CopyFunction("postgre
 	copy_from_function = PostgresReadBinaryFunction();
 }
 
+static FunctionSignature ReadPostgresBinarySignature() {
+	FunctionSignature signature;
+	signature.AddParameter("file_path", LogicalType::VARCHAR).WithTypedKwargs("options", [&](TypedKwargs &options) {
+		options.Add("columns", LogicalType::ANY).Add("buffer_size", LogicalType::UBIGINT);
+	});
+	return signature;
+}
+
 PostgresReadBinaryFunction::PostgresReadBinaryFunction()
-    : TableFunction("read_postgres_binary", {LogicalType::VARCHAR}, PostgresBinaryReadScan, ReadPostgresBinaryBind,
-                    PostgresBinaryReadInitGlobal) {
-	named_parameters["columns"] = LogicalType::ANY;
-	named_parameters["buffer_size"] = LogicalType::UBIGINT;
+    : TableFunction("read_postgres_binary", ReadPostgresBinarySignature(), PostgresBinaryReadScan,
+                    ReadPostgresBinaryBind, PostgresBinaryReadInitGlobal) {
 	serialize = PostgresBinaryReadSerialize;
 	deserialize = PostgresBinaryReadDeserialize;
 }

@@ -9,7 +9,9 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/common/operator/subtract.hpp"
 #include "duckdb/common/types/interval.hpp"
+#include "duckdb/common/types/geometry_crs.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/common/vector/map_vector.hpp"
@@ -105,12 +107,12 @@ public:
 	}
 
 	void WriteTime(dtime_t value) {
-		WriteInteger<uint64_t>(value.micros);
+		WriteInteger<uint64_t>(value.value);
 	}
 
 	void WriteTimeTZ(dtime_tz_t value) {
 		WriteRawInteger<int32_t>(sizeof(uint64_t) + sizeof(int32_t));
-		WriteRawInteger<uint64_t>(value.time().micros);
+		WriteRawInteger<uint64_t>(value.time().value);
 		WriteRawInteger<int32_t>(-value.offset());
 	}
 
@@ -121,7 +123,14 @@ public:
 		if (value == timestamp_t::ninfinity()) {
 			return POSTGRES_NINFINITY;
 		}
-		return uint64_t(value.value - (POSTGRES_EPOCH_TS - DUCKDB_EPOCH_TS));
+		int64_t postgres_usec;
+		if (!TrySubtractOperator::Operation(value.value, static_cast<int64_t>(POSTGRES_EPOCH_TS - DUCKDB_EPOCH_TS),
+		                                    postgres_usec) ||
+		    postgres_usec < POSTGRES_MIN_TIMESTAMP || postgres_usec >= POSTGRES_END_TIMESTAMP) {
+			throw InvalidInputException("TIMESTAMP \"%s\" is out of range for Postgres' TIMESTAMP field",
+			                            Timestamp::ToString(value));
+		}
+		return static_cast<uint64_t>(postgres_usec);
 	}
 
 	void WriteTimestamp(timestamp_t value) {
@@ -208,6 +217,44 @@ public:
 		auto str_data = value.GetData();
 		WriteRawInteger<int32_t>(NumericCast<int32_t>(str_size));
 		stream.WriteData(const_data_ptr_cast(str_data), str_size);
+	}
+
+	//! Write GEOMETRY to PostGIS. If the type carries CRS metadata, writes EWKB
+	//! (WKB with SRID) so PostGIS receives the correct SRID.
+	void WriteGeometry(string_t value, const LogicalType &type) {
+		if (!GeoType::HasCRS(type)) {
+			WriteRawBlob(value);
+			return;
+		}
+		auto &crs = GeoType::GetCRS(type);
+
+		// Extract SRID from CRS identifier (e.g., "EPSG:4326" → 4326)
+		auto &id = crs.GetIdentifier();
+		auto colon = id.find(':');
+		if (colon == string::npos) {
+			WriteRawBlob(value);
+			return;
+		}
+		int32_t srid;
+		try {
+			srid = std::stoi(id.substr(colon + 1));
+		} catch (...) {
+			WriteRawBlob(value);
+			return;
+		}
+
+		// Write EWKB: WKB with SRID flag set on the type field + 4-byte SRID inserted.
+		// [byte_order:1] [type|0x20000000:4] [srid:4] [coordinates...]
+		auto wkb_size = value.GetSize();
+		auto wkb_data = const_data_ptr_cast(value.GetData());
+		WriteRawInteger<int32_t>(NumericCast<int32_t>(wkb_size + 4));
+		stream.WriteData(wkb_data, 1); // byte order
+		uint32_t wkb_type;
+		memcpy(&wkb_type, wkb_data + 1, 4);
+		wkb_type |= 0x20000000;
+		stream.WriteData(const_data_ptr_cast(reinterpret_cast<const uint8_t *>(&wkb_type)), 4); // type + SRID flag
+		stream.WriteData(const_data_ptr_cast(reinterpret_cast<const uint8_t *>(&srid)), 4); // SRID (LE, matching WKB)
+		stream.WriteData(wkb_data + 5, wkb_size - 5);                                       // rest of payload
 	}
 
 	void WriteVarchar(string_t value) {
@@ -357,7 +404,7 @@ public:
 		}
 		case LogicalTypeId::GEOMETRY: {
 			auto data = FlatVector::GetData<string_t>(col)[r];
-			WriteRawBlob(data);
+			WriteGeometry(data, type);
 			break;
 		}
 		case LogicalTypeId::ENUM: {

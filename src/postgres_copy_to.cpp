@@ -1,4 +1,5 @@
 #include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/common/vector/map_vector.hpp"
 #include "duckdb/common/vector/struct_vector.hpp"
 
@@ -60,10 +61,14 @@ void PostgresConnection::BeginCopyTo(ClientContext &context, PostgresCopyState &
 	}
 	query += ")";
 
-	PostgresResult pg_res(PQExecute(context, query.c_str()));
-	auto result = pg_res.res;
-	if (!result || PQresultStatus(result) != PGRES_COPY_IN) {
-		throw std::runtime_error("Failed to prepare COPY \"" + query + "\": " + string(PQresultErrorMessage(result)));
+	{
+		lock_guard<mutex> guard(connection_lock);
+		PostgresResult pg_res(PQExecute(context, query.c_str()));
+		auto result = pg_res.res;
+		if (!result || PQresultStatus(result) != PGRES_COPY_IN) {
+			auto error = result ? PQresultErrorMessage(result) : PQerrorMessage(GetConn());
+			throw std::runtime_error("Failed to prepare COPY \"" + query + "\": " + string(error));
+		}
 	}
 	if (state.format == PostgresCopyFormat::BINARY) {
 		// binary copy requires a header
@@ -74,6 +79,7 @@ void PostgresConnection::BeginCopyTo(ClientContext &context, PostgresCopyState &
 }
 
 void PostgresConnection::CopyData(data_ptr_t buffer, idx_t size) {
+	lock_guard<mutex> guard(connection_lock);
 	int result;
 	do {
 		result = PQputCopyData(GetConn(), (const char *)buffer, int(size));
@@ -104,6 +110,7 @@ void PostgresConnection::FinishCopyTo(PostgresCopyState &state) {
 		CopyData(writer);
 	}
 
+	lock_guard<mutex> guard(connection_lock);
 	auto result_code = PQputCopyEnd(GetConn(), nullptr);
 	if (result_code != 1) {
 		throw InternalException("Error during PQputCopyEnd: %s", PQerrorMessage(GetConn()));
@@ -112,8 +119,8 @@ void PostgresConnection::FinishCopyTo(PostgresCopyState &state) {
 	PostgresResult pg_res(PQgetResult(GetConn()));
 	auto result = pg_res.res;
 	if (!result || PQresultStatus(result) != PGRES_COMMAND_OK) {
-		string error_msg(PQresultErrorMessage(result));
-		throw std::runtime_error("Failed to copy data: " + error_msg);
+		auto error = result ? PQresultErrorMessage(result) : PQerrorMessage(GetConn());
+		throw std::runtime_error("Failed to copy data: " + string(error));
 	}
 }
 

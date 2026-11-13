@@ -1,31 +1,92 @@
 #include "postgres_utils.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 
 #include "dbconnector/query/query_writer.hpp"
 
+#include "storage/postgres_catalog.hpp"
 #include "storage/postgres_schema_entry.hpp"
 #include "storage/postgres_transaction.hpp"
+#include "postgres_scanner.hpp"
 #include "postgres_type_oids.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/geometry_crs.hpp"
 
 namespace duckdb {
+
+mutex PostgresUtils::libpq_init_lock;
+bool PostgresUtils::libpq_connect_succeeded_at_least_once = false;
 
 static void PGNoticeProcessor(void *arg, const char *message) {
 }
 
 PGconn *PostgresUtils::PGConnect(const string &dsn, const string &attach_path) {
+	bool lock_needed = true;
+	{
+		lock_guard<mutex> guard(libpq_init_lock);
+		if (libpq_connect_succeeded_at_least_once) {
+			lock_needed = false;
+		}
+	}
+
+	if (lock_needed) {
+		lock_guard<mutex> guard(libpq_init_lock);
+		idx_t max_attempts = 2;
+		for (idx_t i = 0; i < max_attempts; i++) { // observed sporadic OpenSSL failures on the first connection
+			PostgresConnectCheck check = i < max_attempts - 1 ? PostgresConnectCheck::RETURN_ON_CONNECTION_BAD
+			                                                  : PostgresConnectCheck::THROW_ON_CONNECTION_BAD;
+			PGconn *conn = PGConnectInternal(dsn, attach_path, check);
+			if (PQstatus(conn) == CONNECTION_BAD) {
+				PQfinish(conn);
+				continue;
+			}
+			libpq_connect_succeeded_at_least_once = true;
+			return conn;
+		}
+	}
+
+	return PGConnectInternal(dsn, attach_path, PostgresConnectCheck::THROW_ON_CONNECTION_BAD);
+}
+
+PGconn *PostgresUtils::PGConnectInternal(const string &dsn, const string &attach_path,
+                                         PostgresConnectCheck check_behaviour) {
 	PGconn *conn = PQconnectdb(dsn.c_str());
 
 	// both PQStatus and PQerrorMessage check for nullptr
 	if (PQstatus(conn) == CONNECTION_BAD) {
-		char *msg_cstr = PQerrorMessage(conn);
-		string msg = msg_cstr != nullptr ? string(msg_cstr) : string();
-		PQfinish(conn);
-		throw IOException("Unable TODO:REMOVEME to connect to Postgres at \"%s\": %s", attach_path, msg);
+		if (check_behaviour == PostgresConnectCheck::THROW_ON_CONNECTION_BAD) {
+			char *msg_cstr = PQerrorMessage(conn);
+			string msg = msg_cstr != nullptr ? string(msg_cstr) : string();
+			PQfinish(conn);
+			throw IOException("Unable to connect to Postgres at \"%s\": %s", attach_path, msg);
+		} else {
+			return conn;
+		}
 	}
 	PQsetNoticeProcessor(conn, PGNoticeProcessor, nullptr);
 	return conn;
 }
 
 string PostgresUtils::TypeToString(const LogicalType &input) {
+	// Handle GEOMETRY('EPSG:N') first: the CRS-bearing GEOMETRY type can have
+	// an alias of "GEOMETRY", which would otherwise short-circuit the alias
+	// branch below and emit an untyped `geometry` column (typmod -1).  When
+	// CRS is present, emit a typmod-bearing PostGIS column type so the SRID
+	// survives a CREATE TABLE round trip; otherwise fall through.
+	if (input.id() == LogicalTypeId::GEOMETRY && GeoType::HasCRS(input)) {
+		auto &crs = GeoType::GetCRS(input);
+		auto &id = crs.GetIdentifier();
+		auto colon = id.find(':');
+		if (colon != string::npos) {
+			try {
+				int32_t srid = std::stoi(id.substr(colon + 1));
+				if (srid > 0) {
+					return "geometry(Geometry, " + std::to_string(srid) + ")";
+				}
+			} catch (...) {
+				// fall through to plain GEOMETRY
+			}
+		}
+	}
 	if (input.HasAlias()) {
 		return input.GetAlias();
 	}
@@ -78,6 +139,77 @@ LogicalType PostgresUtils::RemoveAlias(const LogicalType &type) {
 	}
 }
 
+bool PostgresUtils::UseInformationSchemaIntrospection(optional_ptr<ClientContext> context) {
+	if (!context) {
+		return false;
+	}
+	Value value;
+	if (context->TryGetCurrentSetting("pg_use_information_schema_introspection", value)) {
+		return BooleanValue::Get(value);
+	}
+	return false;
+}
+
+bool PostgresUtils::StalenessQueryEnabled(ClientContext &context) {
+	Value value;
+	if (context.TryGetCurrentSetting("pg_staleness_query_enabled", value) && !value.IsNull()) {
+		return BooleanValue::Get(value);
+	}
+	return !UseInformationSchemaIntrospection(&context);
+}
+
+string PostgresUtils::GetCustomStalenessQuery(ClientContext &context) {
+	Value value;
+	if (context.TryGetCurrentSetting("pg_staleness_query", value) && !value.IsNull()) {
+		return StringValue::Get(value);
+	}
+	return string();
+}
+
+string PostgresUtils::DataTypeToTypeName(const string &data_type) {
+	// Map SQL-standard information_schema.columns.data_type values to the
+	// pg_type.typname
+	auto type_name = StringUtil::Lower(data_type);
+	if (type_name == "boolean") {
+		return "bool";
+	} else if (type_name == "smallint") {
+		return "int2";
+	} else if (type_name == "integer") {
+		return "int4";
+	} else if (type_name == "bigint") {
+		return "int8";
+	} else if (type_name == "real") {
+		return "float4";
+	} else if (type_name == "double precision") {
+		return "float8";
+	} else if (type_name == "character varying") {
+		return "varchar";
+	} else if (type_name == "character") {
+		return "bpchar";
+	} else if (type_name == "\"char\"") {
+		return "char";
+	} else if (type_name == "time without time zone") {
+		return "time";
+	} else if (type_name == "time with time zone") {
+		return "timetz";
+	} else if (type_name == "timestamp without time zone") {
+		return "timestamp";
+	} else if (type_name == "timestamp with time zone") {
+		return "timestamptz";
+	} else if (type_name == "bit varying") {
+		return "varbit";
+	} else if (type_name == "binary varying") {
+		// Redshift VARBYTE as reported by pg_get_late_binding_view_cols()
+		return "varbyte";
+	} else if (type_name == "interval year to month") {
+		// Redshift interval types as reported by pg_get_late_binding_view_cols()
+		return "intervaly2m";
+	} else if (type_name == "interval day to second") {
+		return "intervald2s";
+	}
+	return data_type;
+}
+
 uint32_t PostgresUtils::TypeNameToPostgresOid(const string &type_name) {
 	if (type_name == "bool") {
 		return BOOLOID;
@@ -117,25 +249,75 @@ uint32_t PostgresUtils::TypeNameToPostgresOid(const string &type_name) {
 	return 0;
 }
 
+PostgresTypeConfig PostgresTypeConfig::FromContext(optional_ptr<ClientContext> context) {
+	PostgresTypeConfig result;
+	if (!context) {
+		return result;
+	}
+	Value setting;
+	if (context->TryGetCurrentSetting("pg_array_as_varchar", setting)) {
+		result.array_as_varchar = BooleanValue::Get(setting);
+	}
+	if (context->TryGetCurrentSetting("pg_numeric_as_varchar", setting)) {
+		result.numeric_as_varchar = BooleanValue::Get(setting);
+	}
+	if (context->TryGetCurrentSetting("pg_numeric_nan_as_null", setting)) {
+		result.numeric_nan_as_null = BooleanValue::Get(setting);
+	}
+	return result;
+}
+
+//! Redshift-specific types, all of them are read using the text protocol (Redshift does not support binary COPY)
+static bool TryRedshiftTypeToLogicalType(const PostgresTypeData &type_info, PostgresType &postgres_type,
+                                         LogicalType &result) {
+	auto &pgtypename = type_info.type_name;
+	if (pgtypename == "geometry") {
+		// the Redshift type modifier does not follow the PostGIS layout and does not encode the SRID,
+		// the text output is hex EWKB
+		result = LogicalType::GEOMETRY();
+	} else if (pgtypename == "geography") {
+		// the text output is hex EWKB, geography values are always in WGS 84
+		result = LogicalType::GEOMETRY("EPSG:4326");
+	} else if (pgtypename == "intervaly2m") {
+		postgres_type.info = PostgresTypeAnnotation::INTERVAL_YEAR_TO_MONTH;
+		result = LogicalType::INTERVAL;
+	} else if (pgtypename == "intervald2s") {
+		postgres_type.info = PostgresTypeAnnotation::INTERVAL_DAY_TO_SECOND;
+		result = LogicalType::INTERVAL;
+	} else if (pgtypename == "varbyte") {
+		postgres_type.info = PostgresTypeAnnotation::HEX_BLOB;
+		result = LogicalType::BLOB;
+	} else if (pgtypename == "super") {
+		// the output is JSON - SUPER must not be cast to VARCHAR, SUPER::VARCHAR returns NULL for non-string values
+		result = LogicalType::JSON();
+	} else if (pgtypename == "hllsketch") {
+		// the text output is JSON, HLLSKETCH cannot be cast to VARCHAR and has no binary output
+		postgres_type.info = PostgresTypeAnnotation::TEXT_PROTOCOL_ONLY;
+		result = LogicalType::JSON();
+	} else {
+		return false;
+	}
+	return true;
+}
+
 LogicalType PostgresUtils::TypeToLogicalType(optional_ptr<PostgresTransaction> transaction,
                                              optional_ptr<PostgresSchemaEntry> schema,
-                                             const PostgresTypeData &type_info, PostgresType &postgres_type) {
+                                             const PostgresTypeConfig &type_config, const PostgresTypeData &type_info,
+                                             PostgresType &postgres_type) {
 	auto &pgtypename = type_info.type_name;
+
+	if (type_info.instance_type == PostgresInstanceType::REDSHIFT) {
+		LogicalType result;
+		if (TryRedshiftTypeToLogicalType(type_info, postgres_type, result)) {
+			return result;
+		}
+	}
 
 	// postgres array types start with an _
 	if (StringUtil::StartsWith(pgtypename, "_")) {
-		if (transaction) {
-			auto context = transaction->GetContext();
-			if (!context) {
-				throw InternalException("Context is destroyed!?");
-			}
-			Value array_as_varchar;
-			if (context->TryGetCurrentSetting("pg_array_as_varchar", array_as_varchar)) {
-				if (BooleanValue::Get(array_as_varchar)) {
-					postgres_type.info = PostgresTypeAnnotation::CAST_TO_VARCHAR;
-					return LogicalType::VARCHAR;
-				}
-			}
+		if (type_config.array_as_varchar) {
+			postgres_type.info = PostgresTypeAnnotation::CAST_TO_VARCHAR;
+			return LogicalType::VARCHAR;
 		}
 		// get the array dimension information
 		idx_t dimensions = type_info.array_dimensions;
@@ -148,7 +330,8 @@ LogicalType PostgresUtils::TypeToLogicalType(optional_ptr<PostgresTransaction> t
 		child_type_info.type_modifier = type_info.type_modifier;
 		child_type_info.type_schema = type_info.type_schema;
 		PostgresType child_pg_type;
-		auto child_type = PostgresUtils::TypeToLogicalType(transaction, schema, child_type_info, child_pg_type);
+		auto child_type =
+		    PostgresUtils::TypeToLogicalType(transaction, schema, type_config, child_type_info, child_pg_type);
 		// populate the child OID from the actual Postgres type name
 		if (child_pg_type.oid == 0) {
 			child_pg_type.oid = TypeNameToPostgresOid(child_type_info.type_name);
@@ -183,7 +366,10 @@ LogicalType PostgresUtils::TypeToLogicalType(optional_ptr<PostgresTransaction> t
 		auto width = ((type_info.type_modifier - sizeof(int32_t)) >> 16) & 0xffff;
 		auto scale = (((type_info.type_modifier - sizeof(int32_t)) & 0x7ff) ^ 1024) - 1024;
 		if (type_info.type_modifier == -1 || width < 0 || scale < 0 || width > 38) {
-			// fallback to double
+			if (type_config.numeric_as_varchar) {
+				postgres_type.info = PostgresTypeAnnotation::CAST_TO_VARCHAR;
+				return LogicalType::VARCHAR;
+			}
 			postgres_type.info = PostgresTypeAnnotation::NUMERIC_AS_DOUBLE;
 			return LogicalType::DOUBLE;
 		}
@@ -197,6 +383,20 @@ LogicalType PostgresUtils::TypeToLogicalType(optional_ptr<PostgresTransaction> t
 		postgres_type.info = PostgresTypeAnnotation::JSONB;
 		return LogicalType::VARCHAR;
 	} else if (pgtypename == "geometry") {
+		// PostGIS encodes the column-level SRID in the type modifier of
+		// `geometry(TYPE, SRID)` columns. The bit layout is:
+		//   bits  0    : has-M
+		//   bits  1    : has-Z
+		//   bits  2-7  : geometry type code (POINT=1, LINESTRING=2, ...)
+		//   bits  8-29 : SRID
+		// Untyped `geometry` columns carry typmod -1 and we fall back to
+		// plain GEOMETRY (no CRS), matching the previous behavior.
+		if (type_info.type_modifier > 0) {
+			int32_t srid = static_cast<int32_t>((static_cast<uint32_t>(type_info.type_modifier) & 0x0FFFFF00u) >> 8);
+			if (srid > 0) {
+				return LogicalType::GEOMETRY("EPSG:" + std::to_string(srid));
+			}
+		}
 		return LogicalType::GEOMETRY();
 	} else if (pgtypename == "date") {
 		return LogicalType::DATE;
@@ -238,34 +438,44 @@ LogicalType PostgresUtils::TypeToLogicalType(optional_ptr<PostgresTransaction> t
 	} else if (pgtypename == "circle") {
 		postgres_type.info = PostgresTypeAnnotation::GEOM_CIRCLE;
 		return LogicalType::LIST(LogicalType::DOUBLE);
+	}
+
+	if (!transaction || !schema || type_info.type_schema.empty()) {
+		// unsupported, or no type schema to resolve custom types in
+		// (information_schema introspection) - fallback to varchar
+		postgres_type.info = PostgresTypeAnnotation::CAST_TO_VARCHAR;
+		return LogicalType::VARCHAR;
+	}
+
+	auto context = transaction->GetContext();
+	if (!context) {
+		throw InternalException("Context is destroyed!?");
+	}
+
+	Identifier type_schema = Identifier(type_info.type_schema);
+	optional_ptr<SchemaCatalogEntry> lookup_schema;
+	if (type_schema == schema->name) {
+		lookup_schema = schema.get();
 	} else {
-		if (!transaction) {
-			// unsupported so fallback to varchar
-			postgres_type.info = PostgresTypeAnnotation::CAST_TO_VARCHAR;
-			return LogicalType::VARCHAR;
-		}
-		auto context = transaction->GetContext();
-		if (!context) {
-			throw InternalException("Context is destroyed!?");
-		}
-		optional_ptr<SchemaCatalogEntry> lookup_schema =
-		    Identifier(type_info.type_schema) != schema->name
-		        ? schema->ParentCatalog().GetSchema(*context, Identifier(type_info.type_schema),
-		                                            OnEntryNotFound::THROW_EXCEPTION)
-		        : schema.get();
+		Catalog &parent_catalog = schema->ParentCatalog();
+		lookup_schema = parent_catalog.GetSchema(*context, type_schema, OnEntryNotFound::RETURN_NULL);
+	}
+
+	if (lookup_schema) {
 		auto entry = lookup_schema->GetEntry(CatalogTransaction(lookup_schema->ParentCatalog(), *context),
 		                                     CatalogType::TYPE_ENTRY, Identifier(pgtypename));
-		if (!entry) {
-			// unsupported so fallback to varchar
-			postgres_type.info = PostgresTypeAnnotation::CAST_TO_VARCHAR;
-			return LogicalType::VARCHAR;
+		if (entry) {
+			// custom type (e.g. composite or enum)
+			auto &type_entry = entry->Cast<PostgresTypeEntry>();
+			auto result_type = RemoveAlias(type_entry.user_type);
+			postgres_type = type_entry.postgres_type;
+			return result_type;
 		}
-		// custom type (e.g. composite or enum)
-		auto &type_entry = entry->Cast<PostgresTypeEntry>();
-		auto result_type = RemoveAlias(type_entry.user_type);
-		postgres_type = type_entry.postgres_type;
-		return result_type;
 	}
+
+	// either schema or type is not available so fallback to varchar
+	postgres_type.info = PostgresTypeAnnotation::CAST_TO_VARCHAR;
+	return LogicalType::VARCHAR;
 }
 
 LogicalType PostgresUtils::ToPostgresType(const LogicalType &input) {
@@ -297,9 +507,7 @@ LogicalType PostgresUtils::ToPostgresType(const LogicalType &input) {
 			auto &type = StructType::GetChildType(input, c);
 			new_types.push_back(make_pair(name, ToPostgresType(type)));
 		}
-		auto result = LogicalType::STRUCT(std::move(new_types));
-		result.SetAlias(input.GetAlias());
-		return result;
+		return LogicalType::STRUCT(std::move(new_types)).WithAlias(input.GetAlias());
 	}
 	case LogicalTypeId::TIMESTAMP_SEC:
 	case LogicalTypeId::TIMESTAMP_MS:
@@ -316,7 +524,11 @@ LogicalType PostgresUtils::ToPostgresType(const LogicalType &input) {
 	case LogicalTypeId::HUGEINT:
 		return LogicalType::DOUBLE;
 	case LogicalTypeId::GEOMETRY:
-		return LogicalType::GEOMETRY();
+		// Preserve CRS metadata so downstream TypeToString can emit a typmod-
+		// bearing PostGIS column type and the SRID survives a CREATE TABLE
+		// AS round trip.  Returning a CRS-less GEOMETRY here strips the CRS
+		// before it ever reaches the schema-emission path.
+		return input;
 	default:
 		return LogicalType::VARCHAR;
 	}
@@ -366,6 +578,29 @@ bool PostgresUtils::SupportedPostgresOid(const LogicalType &input) {
 		return true;
 	default:
 		return false;
+	}
+}
+
+string PostgresUtils::RedshiftOidToName(uint32_t oid) {
+	switch (oid) {
+	case 1188:
+		return "intervaly2m";
+	case 1190:
+		return "intervald2s";
+	case 2935:
+		return "hllsketch";
+	case 3000:
+	case 3999:
+		// query results report GEOMETRY columns with OID 3999
+		return "geometry";
+	case 3001:
+		return "geography";
+	case 4000:
+		return "super";
+	case 6551:
+		return "varbyte";
+	default:
+		return string();
 	}
 }
 
@@ -549,36 +784,92 @@ string PostgresUtils::QuotePostgresIdentifier(const string &text) {
 	return PostgresUtils::WriteIdentifier(text);
 }
 
-string PostgresUtils::EscapeConnectionString(const string &input) {
-	using namespace dbconnector::query;
-	auto config = QueryWriter::CreateConfig('\'', QuoteEscapeStyle::BACKSLASH);
-	return QueryWriter::WriteQuotedAndEscaped(config, input);
-}
-
-string PostgresUtils::ExtractConnectionOption(const KeyValueSecret &kv_secret, const string &name) {
-	Value input_val = kv_secret.TryGetValue(Identifier(name));
-	if (input_val.IsNull()) {
-		// not provided
-		return string();
-	}
-	string result;
-	result += name;
-	result += "=";
-	result += EscapeConnectionString(input_val.ToString());
-	result += " ";
-	return result;
-}
-
 string PostgresUtils::WriteLiteral(const string &literal) {
 	using namespace dbconnector::query;
 	auto config = QueryWriter::CreateConfig('\'', QuoteEscapeStyle::DOUBLE_QUOTE);
 	return QueryWriter::WriteQuotedAndEscaped(config, literal);
 }
 
+string PostgresUtils::WriteLiteralsCommaSeparated(const vector<string> &literals) {
+	string res;
+	for (idx_t i = 0; i < literals.size(); i++) {
+		const string &lit = literals[i];
+		if (i > 0) {
+			res.append(", ");
+		}
+		res.append(WriteLiteral(lit));
+	}
+	return res;
+}
+
 string PostgresUtils::WriteIdentifier(const string &identifier) {
 	using namespace dbconnector::query;
 	auto config = QueryWriter::CreateConfig('"', QuoteEscapeStyle::DOUBLE_QUOTE);
 	return QueryWriter::WriteQuotedAndEscaped(config, identifier);
+}
+
+PostgresQueryMode PostgresUtils::ExtractQueryMode(ClientContext &ctx) {
+	Value val;
+	if (ctx.TryGetCurrentSetting("pg_query_mode", val)) {
+		return ExtractQueryMode(val);
+	}
+	return PostgresQueryMode::AUTO;
+}
+
+PostgresQueryMode PostgresUtils::ExtractQueryMode(Value &value) {
+	if (value.IsNull()) {
+		throw InvalidInputException("Invalid NULL query mode specified");
+	}
+	string str_raw = value.ToString();
+	string str = StringUtil::Upper(str_raw);
+	if (str == "AUTO") {
+		return PostgresQueryMode::AUTO;
+	} else if (str == "COPY_BINARY") {
+		return PostgresQueryMode::COPY_BINARY;
+
+	} else if (str == "PLAIN_QUERY_BINARY") {
+		return PostgresQueryMode::PLAIN_QUERY_BINARY;
+
+	} else if (str == "PLAIN_QUERY_TEXT") {
+		return PostgresQueryMode::PLAIN_QUERY_TEXT;
+
+	} else {
+		throw InvalidInputException("Invalid query mode specified, must be on of: 'AUTO', 'COPY_BINARY', "
+		                            "'PLAIN_QUERY_BINARY', 'PLAIN_QUERY_TEXT'");
+	}
+}
+
+PostgresCatalog &PostgresUtils::GetCatalogByName(ClientContext &context, const std::string &name) {
+	auto &db_manager = DatabaseManager::Get(context);
+	auto db = db_manager.GetDatabase(context, Identifier(name));
+	if (!db) {
+		throw BinderException("Failed to find attached database \"%s\"", name);
+	}
+	auto &catalog = db->GetCatalog();
+	if (catalog.GetCatalogType() != "postgres") {
+		throw BinderException("Attached database \"%s\" does not refer to a Postgres database", name);
+	}
+	return catalog.Cast<PostgresCatalog>();
+}
+
+void PostgresUtils::DeduplicateColumns(vector<Identifier> &names) {
+	identifier_map_t<idx_t> name_map;
+	for (auto &column_name : names) {
+		if (name_map.find(column_name) == name_map.end()) {
+			// Name does not exist yet
+			name_map[column_name]++;
+		} else {
+			// Name already exists, we add _x where x is the repetition number
+			Identifier new_column_name(column_name + "_" + std::to_string(name_map[column_name]));
+			while (name_map.find(new_column_name) != name_map.end()) {
+				// This name is already here due to a previous definition
+				name_map[column_name]++;
+				new_column_name = Identifier(column_name + "_" + std::to_string(name_map[column_name]));
+			}
+			column_name = new_column_name;
+			name_map[new_column_name]++;
+		}
+	}
 }
 
 } // namespace duckdb

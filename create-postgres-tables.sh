@@ -24,13 +24,14 @@ CALL dbgen(sf=0.01, schema='tpch');
 CALL dsdgen(sf=0.01, schema='tpcds');
 EXPORT DATABASE '${ABS_DIR_PREFIX}/postgresscannertmp';
 " | \
-$DUCKDB_PATH
+$DUCKDB_PATH -unsigned
 
 dropdb --if-exists postgresscanner
 createdb postgresscanner
 
 psql -d postgresscanner < ${ABS_DIR_PREFIX}/postgresscannertmp/schema.sql
-psql -d postgresscanner < ${ABS_DIR_PREFIX}/postgresscannertmp/load.sql
+sed -E "s/,[[:space:]]*allow_quoted_nulls[[:space:]]+[^,)]+//g" ${ABS_DIR_PREFIX}/postgresscannertmp/load.sql > ${ABS_DIR_PREFIX}/postgresscannertmp/load_filtered.sql
+psql -d postgresscanner < ${ABS_DIR_PREFIX}/postgresscannertmp/load_filtered.sql
 rm -rf ${ABS_DIR_PREFIX}/postgresscannertmp
 
 psql -d postgresscanner < test/all_pg_types.sql

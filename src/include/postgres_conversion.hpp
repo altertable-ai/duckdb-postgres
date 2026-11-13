@@ -29,8 +29,11 @@
 #define POSTGRES_DATE_NINF   2147483648U
 #define POSTGRES_EPOCH_TS    211813488000000000ULL
 #define DUCKDB_EPOCH_TS      210866803200000000ULL
-#define POSTGRES_INFINITY    9223372036854775807ULL
-#define POSTGRES_NINFINITY   9223372036854775808ULL
+/* Values from PostgreSQL's datatype/timestamp.h. The end is exclusive. */
+#define POSTGRES_MIN_TIMESTAMP (-211813488000000000LL)
+#define POSTGRES_END_TIMESTAMP 9223371331200000000LL
+#define POSTGRES_INFINITY      9223372036854775807ULL
+#define POSTGRES_NINFINITY     9223372036854775808ULL
 
 #define NBASE      10000
 #define DEC_DIGITS 4 /* decimal digits per NBASE digit */
@@ -96,6 +99,21 @@ struct PostgresDecimalConfig {
 	uint16_t ndigits;
 	int16_t weight;
 	bool is_negative;
+	uint16_t sign;
+};
+
+enum class PostgresDecimalKind { ORDINARY, NOT_A_NUMBER, POSITIVE_INFINITY, NEGATIVE_INFINITY };
+
+template <typename T>
+struct PostgresDecimal {
+	T value;
+	PostgresDecimalKind kind;
+
+	PostgresDecimal(T val) : value(val), kind(PostgresDecimalKind::ORDINARY) {
+	}
+
+	PostgresDecimal(PostgresDecimalKind kind_p) : value(0), kind(kind_p) {
+	}
 };
 
 struct PostgresConversion {
@@ -187,16 +205,6 @@ struct DecimalConversionHugeint {
 
 	static hugeint_t Finalize(const PostgresDecimalConfig &config, hugeint_t result) {
 		return result;
-	}
-};
-
-struct DecimalConversionDouble {
-	static double GetPowerOfTen(idx_t index) {
-		return pow(10, double(index));
-	}
-
-	static double Finalize(const PostgresDecimalConfig &config, double result) {
-		return result / GetPowerOfTen(config.scale);
 	}
 };
 

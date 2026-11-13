@@ -1,4 +1,7 @@
 #include "storage/postgres_index_set.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
@@ -15,7 +18,7 @@ PostgresIndexSet::PostgresIndexSet(PostgresSchemaEntry &schema, unique_ptr<Postg
     : PostgresInSchemaSet(schema, !index_result_p), index_result(std::move(index_result_p)) {
 }
 
-string PostgresIndexSet::GetInitializeQuery(const string &schema) {
+string PostgresIndexSet::GetInitializeQuery(const vector<string> &schemas) {
 	string base_query = R"(
 SELECT pg_namespace.oid, tablename, indexname
 FROM pg_indexes
@@ -24,8 +27,8 @@ ${CONDITION}
 ORDER BY pg_namespace.oid;
 )";
 	string condition;
-	if (!schema.empty()) {
-		condition += "WHERE pg_namespace.nspname=" + PostgresUtils::WriteLiteral(schema);
+	if (schemas.size() > 0) {
+		condition += "WHERE pg_namespace.nspname IN (" + PostgresUtils::WriteLiteralsCommaSeparated(schemas) + ")";
 	}
 	return StringUtil::Replace(base_query, "${CONDITION}", condition);
 }
@@ -39,9 +42,11 @@ void PostgresIndexSet::LoadEntries(ClientContext &context, PostgresTransaction &
 		auto table_name = result.GetString(row, 1);
 		auto index_name = result.GetString(row, 2);
 		CreateIndexInfo info;
-		info.schema = schema.name;
+		info.constraint_type = IndexConstraintType::NONE;
+		info.SetQualifiedName(
+		    QualifiedName(info.GetQualifiedName().Catalog(), schema.name, info.GetQualifiedName().Name()));
 		info.table = Identifier(table_name);
-		info.index_name = Identifier(index_name);
+		info.SetIndexName(Identifier(index_name));
 		auto index_entry = make_shared_ptr<PostgresIndexEntry>(catalog, schema, info, table_name);
 		CreateEntry(transaction, std::move(index_entry));
 	}
@@ -65,7 +70,7 @@ string PGGetCreateIndexSQL(CreateIndexInfo &info, TableCatalogEntry &tbl) {
 		sql += " UNIQUE";
 	}
 	sql += " INDEX ";
-	sql += PostgresUtils::QuotePostgresIdentifier(info.index_name.GetIdentifierName());
+	sql += PostgresUtils::QuotePostgresIdentifier(info.GetIndexName().GetIdentifierName());
 	sql += " ON ";
 	sql += PostgresUtils::QuotePostgresIdentifier(tbl.schema.name.GetIdentifierName()) + ".";
 	sql += PostgresUtils::QuotePostgresIdentifier(tbl.name.GetIdentifierName());

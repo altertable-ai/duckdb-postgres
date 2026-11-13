@@ -1,4 +1,5 @@
 #include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/common/vector/map_vector.hpp"
 #include "duckdb/common/vector/string_vector.hpp"
 #include "duckdb/common/vector/struct_vector.hpp"
@@ -9,8 +10,9 @@
 namespace duckdb {
 
 PostgresTextReader::PostgresTextReader(ClientContext &context, PostgresConnection &con_p,
-                                       const vector<column_t> &column_ids, const PostgresBindData &bind_data)
-    : PostgresResultReader(con_p, column_ids, bind_data), context(context) {
+                                       const vector<column_t> &column_ids, const PostgresBindData &bind_data,
+                                       optional_ptr<PostgresPreparedStatement> prepared_statement)
+    : PostgresResultReader(con_p, column_ids, bind_data, prepared_statement), context(context) {
 }
 
 PostgresTextReader::~PostgresTextReader() {
@@ -18,7 +20,7 @@ PostgresTextReader::~PostgresTextReader() {
 }
 
 void PostgresTextReader::BeginCopy(ClientContext &context, const string &sql) {
-	result = con.Query(context, sql, bind_data.params);
+	result = Query(context, sql, 0);
 	row_offset = 0;
 }
 
@@ -275,13 +277,13 @@ void PostgresTextReader::ConvertCTID(Vector &source, Vector &target, idx_t count
 	}
 }
 
-void PostgresTextReader::ConvertBlob(Vector &source, Vector &target, idx_t count) {
-	// ctids have the format (page_index, row_in_page)
+static void ConvertHexBlob(Vector &source, Vector &target, idx_t count, bool has_hex_prefix) {
 	UnifiedVectorFormat vdata;
 	source.ToUnifiedFormat(vdata);
 	auto strings = UnifiedVectorFormat::GetData<string_t>(vdata);
 	auto result = FlatVector::GetDataMutable<string_t>(target);
 
+	idx_t prefix_size = has_hex_prefix ? 2 : 0;
 	for (idx_t i = 0; i < count; i++) {
 		if (!vdata.validity.RowIsValid(i)) {
 			// NULL value - skip
@@ -291,20 +293,25 @@ void PostgresTextReader::ConvertBlob(Vector &source, Vector &target, idx_t count
 		auto blob_str = strings[i];
 		auto str = blob_str.GetData();
 		auto size = blob_str.GetSize();
-		if (size < 2 || str[0] != '\\' || str[1] != 'x') {
+		if (has_hex_prefix && (size < 2 || str[0] != '\\' || str[1] != 'x')) {
 			throw InvalidInputException("Incorrect blob format - expected \\x... for blob");
 		}
 		if (size % 2 != 0) {
 			throw InvalidInputException("Blob size must be modulo 2 (\\xAA)");
 		}
 		string result_blob;
-		for (idx_t i = 2; i < size; i += 2) {
+		for (idx_t i = prefix_size; i < size; i += 2) {
 			int byte_a = Blob::HEX_MAP[static_cast<uint8_t>(str[i])];
 			int byte_b = Blob::HEX_MAP[static_cast<uint8_t>(str[i + 1])];
 			result_blob += UnsafeNumericCast<data_t>((byte_a << 4) + byte_b);
 		}
 		result[i] = StringVector::AddStringOrBlob(target, result_blob);
 	}
+}
+
+void PostgresTextReader::ConvertBlob(Vector &source, Vector &target, idx_t count) {
+	// bytea in the hex format: \x0123...
+	ConvertHexBlob(source, target, count, true);
 }
 
 static void ConvertGeometry(Vector &source, Vector &target, idx_t count) {
@@ -361,6 +368,10 @@ void PostgresTextReader::ConvertVector(Vector &source, Vector &target, const Pos
 		ConvertCTID(source, target, count);
 		return;
 	}
+	if (postgres_type.info == PostgresTypeAnnotation::HEX_BLOB) {
+		ConvertHexBlob(source, target, count, false);
+		return;
+	}
 	switch (target.GetType().id()) {
 	case LogicalTypeId::LIST:
 		ConvertList(source, target, postgres_type, count);
@@ -392,8 +403,8 @@ PostgresReadResult PostgresTextReader::Read(DataChunk &output) {
 		scan_chunk.Initialize(context, types);
 	}
 	scan_chunk.Reset();
-	for (; scan_chunk.size() < STANDARD_VECTOR_SIZE && row_offset < result->Count(); row_offset++) {
-		idx_t output_offset = scan_chunk.size();
+	idx_t output_offset = 0;
+	for (; output_offset < STANDARD_VECTOR_SIZE && row_offset < result->Count(); row_offset++, output_offset++) {
 		for (idx_t output_idx = 0; output_idx < output.ColumnCount(); output_idx++) {
 			auto col_idx = column_ids[output_idx];
 			auto &out_vec = scan_chunk.data[output_idx];
@@ -405,8 +416,8 @@ PostgresReadResult PostgresTextReader::Read(DataChunk &output) {
 			col_data[output_offset] =
 			    StringVector::AddStringOrBlob(out_vec, result->GetStringRef(row_offset, output_idx));
 		}
-		scan_chunk.SetChildCardinality(scan_chunk.size() + 1);
 	}
+	scan_chunk.SetChildCardinality(output_offset);
 	for (idx_t c = 0; c < output.ColumnCount(); c++) {
 		auto col_idx = column_ids[c];
 		if (col_idx == COLUMN_IDENTIFIER_ROW_ID) {
@@ -414,7 +425,7 @@ PostgresReadResult PostgresTextReader::Read(DataChunk &output) {
 			ctid_type.info = PostgresTypeAnnotation::CTID;
 			ConvertVector(scan_chunk.data[c], output.data[c], ctid_type, scan_chunk.size());
 		} else {
-			ConvertVector(scan_chunk.data[c], output.data[c], bind_data.postgres_types[c], scan_chunk.size());
+			ConvertVector(scan_chunk.data[c], output.data[c], bind_data.postgres_types[col_idx], scan_chunk.size());
 		}
 	}
 	output.SetChildCardinality(scan_chunk.size());

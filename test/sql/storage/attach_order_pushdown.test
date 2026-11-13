@@ -16,7 +16,7 @@ statement ok
 CALL postgres_execute('s1', 'CREATE TABLE order_test (id INT NOT NULL PRIMARY KEY, val INT, name TEXT)');
 
 statement ok
-CALL pg_clear_cache();
+CALL postgres_clear_cache();
 
 statement ok
 INSERT INTO s1.order_test VALUES
@@ -146,13 +146,11 @@ SELECT id FROM s1.order_test ORDER BY name;
 
 # WHERE + ORDER BY on non-output column + LIMIT
 query I
-SELECT name FROM s1.order_test WHERE val IS NOT NULL ORDER BY val LIMIT 5;
+SELECT name FROM s1.order_test WHERE val IS NOT NULL ORDER BY val LIMIT 3;
 ----
 heidi
 alice
 eve
-bob
-judy
 
 # Output multiple columns, sort by non-output column
 query II

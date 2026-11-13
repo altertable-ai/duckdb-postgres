@@ -9,6 +9,7 @@
 #pragma once
 
 #include "storage/postgres_catalog_set.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "storage/postgres_type_entry.hpp"
 
 namespace duckdb {
@@ -25,8 +26,8 @@ public:
 public:
 	optional_ptr<CatalogEntry> CreateType(PostgresTransaction &transaction, CreateTypeInfo &info);
 
-	static string GetInitializeEnumsQuery(PostgresVersion version, const string &schema = string());
-	static string GetInitializeCompositesQuery(const string &schema = string());
+	static string GetInitializeEnumsQuery(PostgresVersion version, const vector<string> &schemas);
+	static string GetInitializeCompositesQuery(const vector<string> &schemas);
 
 protected:
 	bool HasInternalDependencies() const override {

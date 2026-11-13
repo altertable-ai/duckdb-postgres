@@ -9,11 +9,14 @@
 #pragma once
 
 #include "duckdb/transaction/transaction.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "postgres_connection.hpp"
 #include "storage/postgres_connection_pool.hpp"
 
 namespace duckdb {
 class PostgresCatalog;
+class PostgresCatalogSet;
 class PostgresSchemaEntry;
 class PostgresTableEntry;
 
@@ -30,6 +33,8 @@ public:
 
 	PostgresConnection &GetConnectionWithoutTransaction();
 	PostgresConnection &GetConnection();
+	//! ID of the pooled connection used by this transaction
+	uint64_t GetPoolConnectionId();
 	optional_ptr<ClientContext> GetContext();
 
 	string GetDSN();
@@ -43,13 +48,21 @@ public:
 
 	string GetTemporarySchema();
 
+	PostgresTransactionState GetTransactionState() const {
+		return transaction_state;
+	}
+	void StageStalenessSignature(PostgresCatalogSet &catalog_set, string signature);
+
 private:
 	PostgresPoolConnection connection;
 	PostgresTransactionState transaction_state;
 	AccessMode access_mode;
 	PostgresIsolationLevel isolation_level;
 	string temporary_schema;
+	mutex referenced_entries_lock;
 	reference_map_t<CatalogEntry, shared_ptr<CatalogEntry>> referenced_entries;
+	mutex pending_signatures_lock;
+	vector<pair<reference<PostgresCatalogSet>, string>> pending_signatures;
 
 private:
 	//! Retrieves the connection **without** starting a transaction if none is active

@@ -1,4 +1,6 @@
 #include "storage/postgres_table_set.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
@@ -13,6 +15,7 @@
 
 #include "postgres_conversion.hpp"
 #include "postgres_utils.hpp"
+#include "storage/postgres_catalog.hpp"
 #include "storage/postgres_transaction.hpp"
 #include "storage/postgres_schema_entry.hpp"
 
@@ -22,14 +25,72 @@ PostgresTableSet::PostgresTableSet(PostgresSchemaEntry &schema, unique_ptr<Postg
     : PostgresInSchemaSet(schema, !table_result_p), table_result(std::move(table_result_p)) {
 }
 
-string PostgresTableSet::GetInitializeQuery(const string &schema, const string &table) {
+string PostgresTableSet::GetInitializeQuery(PostgresVersion version, const string &schema, const string &table) {
+	vector<string> vec;
+	vec.push_back(schema);
+	return GetInitializeQuery(version, vec, table);
+}
+
+//! Expression returning 'g' for generated columns, 'd' for columns that have a default value (including SERIAL and
+//! identity columns), and NULL otherwise
+static string GetColumnDefaultExpression(PostgresVersion version) {
+	string result = "CASE";
+	if (version >= PostgresVersion(12, 0)) {
+		result += " WHEN pg_attribute.attgenerated <> '' THEN 'g'";
+	}
+	if (version >= PostgresVersion(10, 0)) {
+		result += " WHEN pg_attribute.attidentity <> '' THEN 'd'";
+	}
+	result += " WHEN pg_attribute.atthasdef THEN 'd' END";
+	return result;
+}
+
+//! Redshift late-binding views (CREATE VIEW ... WITH NO SCHEMA BINDING) have no pg_attribute entries (relnatts = 0),
+//! their columns are only exposed through pg_get_late_binding_view_cols(). The column type is returned formatted
+//! (e.g. "numeric(10,2)" or "character varying(100)"), so it is split into the type name and the type modifier here.
+static string GetRedshiftLateBindingViewQuery() {
+	return R"(
+UNION ALL
+SELECT pg_namespace.oid AS namespace_id, relname, relpages, lbv.col_name AS attname,
+    CASE WHEN lbv.paren > 0 THEN RTRIM(SUBSTRING(lbv.col_type, 1, lbv.paren - 1)) ELSE lbv.col_type END AS type_name,
+    CASE
+        WHEN lbv.paren = 0 THEN -1
+        WHEN lbv.col_type LIKE 'numeric(%' OR lbv.col_type LIKE 'decimal(%'
+            THEN SPLIT_PART(lbv.type_args, ',', 1)::INTEGER * 65536
+                + COALESCE(NULLIF(TRIM(SPLIT_PART(lbv.type_args, ',', 2)), ''), '0')::INTEGER + 4
+        WHEN lbv.col_type LIKE 'character varying(%' OR lbv.col_type LIKE 'character(%'
+            THEN lbv.type_args::INTEGER + 4
+        ELSE -1
+    END AS type_modifier,
+    0 AS ndim, lbv.col_num AS attnum, false AS notnull, NULL constraint_id,
+    NULL constraint_type, NULL constraint_key, NULL AS type_schema,
+    NULL AS column_comment,
+    tbl_desc.description AS table_comment,
+    NULL AS column_default
+FROM (
+    SELECT view_schema, view_name, col_name, col_type, col_num, STRPOS(col_type, '(') AS paren,
+        CASE WHEN STRPOS(col_type, '(') > 0
+            THEN SUBSTRING(col_type, STRPOS(col_type, '(') + 1, STRPOS(col_type, ')') - STRPOS(col_type, '(') - 1)
+        END AS type_args
+    FROM pg_get_late_binding_view_cols()
+        cols(view_schema NAME, view_name NAME, col_name NAME, col_type VARCHAR, col_num INTEGER)
+) lbv
+JOIN pg_namespace ON pg_namespace.nspname = lbv.view_schema
+JOIN pg_class ON pg_class.relnamespace = pg_namespace.oid AND pg_class.relname = lbv.view_name
+LEFT JOIN pg_description tbl_desc ON tbl_desc.objoid=pg_class.oid AND tbl_desc.objsubid=0
+WHERE relkind = 'v' ${CONDITION})";
+}
+
+string PostgresTableSet::GetInitializeQuery(PostgresVersion version, const vector<string> &schemas,
+                                            const string &table) {
 	string base_query = R"(
 SELECT pg_namespace.oid AS namespace_id, relname, relpages, attname,
     pg_type.typname type_name, atttypmod type_modifier, pg_attribute.attndims ndim,
     attnum, pg_attribute.attnotnull AS notnull, NULL constraint_id,
     NULL constraint_type, NULL constraint_key, type_ns.nspname AS type_schema,
     col_desc.description AS column_comment,
-    tbl_desc.description AS table_comment
+    tbl_desc.description AS table_comment,
+    ${COLUMN_DEFAULT} AS column_default
 FROM pg_class
 JOIN pg_namespace ON relnamespace = pg_namespace.oid
 JOIN pg_attribute ON pg_class.oid=pg_attribute.attrelid
@@ -37,13 +98,13 @@ JOIN pg_type ON atttypid=pg_type.oid
 JOIN pg_namespace type_ns ON pg_type.typnamespace = type_ns.oid
 LEFT JOIN pg_description col_desc ON col_desc.objoid=pg_class.oid AND col_desc.objsubid=pg_attribute.attnum
 LEFT JOIN pg_description tbl_desc ON tbl_desc.objoid=pg_class.oid AND tbl_desc.objsubid=0
-WHERE attnum > 0 AND relkind IN ('r', 'v', 'm', 'f', 'p') ${CONDITION}
+WHERE attnum > 0 AND relkind IN ('r', 'v', 'm', 'f', 'p') ${CONDITION}${LATE_BINDING_VIEWS}
 UNION ALL
 SELECT pg_namespace.oid AS namespace_id, relname, NULL relpages, NULL attname, NULL type_name,
     NULL type_modifier, NULL ndim, NULL attnum, NULL AS notnull,
     pg_constraint.oid AS constraint_id, contype AS constraint_type,
     conkey AS constraint_key, NULL AS type_schema,
-    NULL AS column_comment, NULL AS table_comment
+    NULL AS column_comment, NULL AS table_comment, NULL AS column_default
 FROM pg_class
 JOIN pg_namespace ON relnamespace = pg_namespace.oid
 JOIN pg_constraint ON (pg_class.oid=pg_constraint.conrelid)
@@ -51,22 +112,54 @@ WHERE relkind IN ('r', 'v', 'm', 'f', 'p') AND contype IN ('p', 'u') ${CONDITION
 ORDER BY namespace_id, relname, attnum, constraint_id;
 )";
 	string condition;
-	if (!schema.empty()) {
-		condition += "AND pg_namespace.nspname=" + PostgresUtils::WriteLiteral(schema);
+	if (schemas.size() > 0) {
+		condition += "AND pg_namespace.nspname IN (" + PostgresUtils::WriteLiteralsCommaSeparated(schemas) + ")";
 	}
 	if (!table.empty()) {
 		condition += "AND relname=" + PostgresUtils::WriteLiteral(table);
+	}
+	base_query = StringUtil::Replace(base_query, "${COLUMN_DEFAULT}", GetColumnDefaultExpression(version));
+	base_query = StringUtil::Replace(
+	    base_query, "${LATE_BINDING_VIEWS}",
+	    version.type_v == PostgresInstanceType::REDSHIFT ? GetRedshiftLateBindingViewQuery() : string());
+	return StringUtil::Replace(base_query, "${CONDITION}", condition);
+}
+
+string PostgresTableSet::GetInitializeQueryInformationSchema(const string &schema, const string &table) {
+	vector<string> vec;
+	vec.push_back(schema);
+	return GetInitializeQueryInformationSchema(vec, table);
+}
+
+string PostgresTableSet::GetInitializeQueryInformationSchema(const vector<string> &schemas, const string &table) {
+	string base_query = R"(
+SELECT table_schema AS namespace_id, table_name AS relname, 0 AS relpages, column_name AS attname,
+    data_type AS type_name, -1 AS type_modifier, 0 AS ndim, ordinal_position AS attnum,
+    CASE WHEN is_nullable = 'NO' THEN 't' ELSE 'f' END AS notnull,
+    NULL AS constraint_id, NULL AS constraint_type, NULL AS constraint_key,
+    NULL AS type_schema, NULL AS column_comment, NULL AS table_comment,
+    CASE WHEN column_default IS NOT NULL THEN 'd' END AS column_default
+FROM information_schema.columns
+WHERE table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast') ${CONDITION}
+ORDER BY table_schema, table_name, ordinal_position;
+)";
+	string condition;
+	if (schemas.size() > 0) {
+		condition += "AND table_schema IN (" + PostgresUtils::WriteLiteralsCommaSeparated(schemas) + ")";
+	}
+	if (!table.empty()) {
+		condition += " AND table_name=" + PostgresUtils::WriteLiteral(table);
 	}
 	return StringUtil::Replace(base_query, "${CONDITION}", condition);
 }
 
 void PostgresTableSet::AddColumn(optional_ptr<PostgresTransaction> transaction,
-                                 optional_ptr<PostgresSchemaEntry> schema, PostgresResult &result, idx_t row,
-                                 PostgresTableInfo &table_info) {
+                                 optional_ptr<PostgresSchemaEntry> schema, const PostgresTypeConfig &type_config,
+                                 PostgresResult &result, idx_t row, PostgresTableInfo &table_info) {
 	PostgresTypeData type_info;
 	idx_t column_index = 3;
 	auto column_name = result.GetString(row, column_index);
-	type_info.type_name = result.GetString(row, column_index + 1);
+	type_info.type_name = PostgresUtils::DataTypeToTypeName(result.GetString(row, column_index + 1));
 	type_info.type_modifier = result.GetInt64(row, column_index + 2);
 	type_info.array_dimensions = result.GetInt64(row, column_index + 3);
 	bool is_not_null = result.GetBool(row, column_index + 5);
@@ -75,24 +168,40 @@ void PostgresTableSet::AddColumn(optional_ptr<PostgresTransaction> transaction,
 	if (!result.IsNull(row, type_schema_index)) {
 		type_info.type_schema = result.GetString(row, type_schema_index);
 	}
+	if (schema) {
+		type_info.instance_type = schema->catalog.Cast<PostgresCatalog>().GetPostgresVersion().type_v;
+	}
 	string default_value;
 
 	PostgresType postgres_type;
-	auto column_type = PostgresUtils::TypeToLogicalType(transaction, schema, type_info, postgres_type);
+	auto column_type = PostgresUtils::TypeToLogicalType(transaction, schema, type_config, type_info, postgres_type);
 	table_info.postgres_types.push_back(std::move(postgres_type));
 	table_info.postgres_names.push_back(column_name);
+	string type_name =
+	    type_info.type_schema.empty() ? string() : PostgresUtils::WriteIdentifier(type_info.type_schema) + ".";
+	table_info.postgres_type_names.push_back(type_name + PostgresUtils::WriteIdentifier(type_info.type_name));
+	auto column_default = PostgresColumnDefault::NONE;
+	if (!result.IsNull(row, 15)) {
+		column_default =
+		    result.GetString(row, 15) == "g" ? PostgresColumnDefault::GENERATED : PostgresColumnDefault::DEFAULT_VALUE;
+	}
+	table_info.column_defaults.push_back(column_default);
 	ColumnDefinition column(Identifier(std::move(column_name)), std::move(column_type));
 	if (!column_comment.empty()) {
 		column.SetComment(Value(column_comment));
 	}
 	if (!default_value.empty()) {
-		auto expressions = Parser::ParseExpressionList(default_value);
+		auto expressions = Parser::GetBuiltinParser().ParseExpressionList(default_value);
 		if (expressions.empty()) {
 			throw InternalException("Expression list is empty");
 		}
 		column.SetDefaultValue(std::move(expressions[0]));
 	}
 	auto &create_info = *table_info.create_info;
+	if (!result.IsNull(row, 7)) {
+		auto attnum = result.GetInt64(row, 7);
+		table_info.attnum_to_logical[attnum] = create_info.columns.LogicalColumnCount();
+	}
 	if (is_not_null) {
 		create_info.constraints.push_back(
 		    make_uniq<NotNullConstraint>(LogicalIndex(create_info.columns.PhysicalColumnCount())));
@@ -114,24 +223,26 @@ void PostgresTableSet::AddConstraint(PostgresResult &result, idx_t row, Postgres
 	auto splits = StringUtil::Split(constraint_key.substr(1, constraint_key.size() - 2), ",");
 	vector<Identifier> columns;
 	for (auto &split : splits) {
-		auto index = std::stoull(split);
-		if (index <= 0 || index > create_info.columns.LogicalColumnCount()) {
+		auto attnum = std::stoll(split);
+		auto entry = table_info.attnum_to_logical.find(attnum);
+		if (entry == table_info.attnum_to_logical.end()) {
 			return;
 		}
-		columns.push_back(create_info.columns.GetColumn(LogicalIndex(index - 1)).Name());
+		columns.push_back(create_info.columns.GetColumn(LogicalIndex(entry->second)).Name());
 	}
 
 	create_info.constraints.push_back(make_uniq<UniqueConstraint>(std::move(columns), constraint_type == "p"));
 }
 
 void PostgresTableSet::AddColumnOrConstraint(optional_ptr<PostgresTransaction> transaction,
-                                             optional_ptr<PostgresSchemaEntry> schema, PostgresResult &result,
-                                             idx_t row, PostgresTableInfo &table_info) {
+                                             optional_ptr<PostgresSchemaEntry> schema,
+                                             const PostgresTypeConfig &type_config, PostgresResult &result, idx_t row,
+                                             PostgresTableInfo &table_info) {
 	if (result.IsNull(row, 3)) {
 		// constraint
 		AddConstraint(result, row, table_info);
 	} else {
-		AddColumn(transaction, schema, result, row, table_info);
+		AddColumn(transaction, schema, type_config, result, row, table_info);
 	}
 }
 
@@ -139,6 +250,7 @@ void PostgresTableSet::CreateEntries(PostgresTransaction &transaction, PostgresR
 	vector<unique_ptr<PostgresTableInfo>> tables;
 	unique_ptr<PostgresTableInfo> info;
 
+	auto type_config = PostgresTypeConfig::FromContext(transaction.GetContext());
 	for (idx_t row = start; row < end; row++) {
 		auto table_name = result.GetString(row, 1);
 		if (!info || info->GetTableName() != table_name) {
@@ -152,7 +264,7 @@ void PostgresTableSet::CreateEntries(PostgresTransaction &transaction, PostgresR
 				info->create_info->comment = Value(result.GetString(row, 14));
 			}
 		}
-		AddColumnOrConstraint(&transaction, &schema, result, row, *info);
+		AddColumnOrConstraint(&transaction, &schema, type_config, result, row, *info);
 	}
 	if (info) {
 		tables.push_back(std::move(info));
@@ -168,7 +280,10 @@ void PostgresTableSet::LoadEntries(ClientContext &context, PostgresTransaction &
 		CreateEntries(transaction, table_result->GetResult(), table_result->start, table_result->end);
 		table_result.reset();
 	} else {
-		auto query = GetInitializeQuery(schema.name.GetIdentifierName());
+		auto query = PostgresUtils::UseInformationSchemaIntrospection(context)
+		                 ? GetInitializeQueryInformationSchema(schema.name.GetIdentifierName())
+		                 : GetInitializeQuery(catalog.Cast<PostgresCatalog>().GetPostgresVersion(),
+		                                      schema.name.GetIdentifierName());
 
 		auto result = transaction.Query(query);
 		auto rows = result->Count();
@@ -177,17 +292,43 @@ void PostgresTableSet::LoadEntries(ClientContext &context, PostgresTransaction &
 	}
 }
 
+string PostgresTableSet::GetStalenessQuery(ClientContext &context) const {
+	if (!PostgresUtils::StalenessQueryEnabled(context)) {
+		return string();
+	}
+	auto custom_query = PostgresUtils::GetCustomStalenessQuery(context);
+	if (!custom_query.empty()) {
+		if (custom_query.find("${SCHEMA}") == string::npos) {
+			throw InvalidInputException("pg_staleness_query must contain a ${SCHEMA} placeholder");
+		}
+		return StringUtil::Replace(custom_query, "${SCHEMA}",
+		                           PostgresUtils::WriteLiteral(schema.name.GetIdentifierName()));
+	}
+	string base_query = R"(
+SELECT pg_class.oid, relname, pg_class.xmin
+FROM pg_class
+JOIN pg_namespace ON relnamespace = pg_namespace.oid
+WHERE relkind IN ('r', 'v', 'm', 'f', 'p') AND pg_namespace.nspname = ${SCHEMA}
+ORDER BY pg_class.oid;
+)";
+	return StringUtil::Replace(base_query, "${SCHEMA}", PostgresUtils::WriteLiteral(schema.name.GetIdentifierName()));
+}
+
 unique_ptr<PostgresTableInfo> PostgresTableSet::GetTableInfo(PostgresTransaction &transaction,
                                                              PostgresSchemaEntry &schema, const string &table_name) {
-	auto query = PostgresTableSet::GetInitializeQuery(schema.name.GetIdentifierName(), table_name);
+	auto query = PostgresUtils::UseInformationSchemaIntrospection(transaction.GetContext())
+	                 ? GetInitializeQueryInformationSchema(schema.name.GetIdentifierName(), table_name)
+	                 : GetInitializeQuery(schema.catalog.Cast<PostgresCatalog>().GetPostgresVersion(),
+	                                      schema.name.GetIdentifierName(), table_name);
 	auto result = transaction.Query(query);
 	auto rows = result->Count();
 	if (rows == 0) {
 		return nullptr;
 	}
 	auto table_info = make_uniq<PostgresTableInfo>(schema, table_name);
+	auto type_config = PostgresTypeConfig::FromContext(transaction.GetContext());
 	for (idx_t row = 0; row < rows; row++) {
-		AddColumnOrConstraint(&transaction, &schema, *result, row, *table_info);
+		AddColumnOrConstraint(&transaction, &schema, type_config, *result, row, *table_info);
 	}
 	table_info->approx_num_pages = result->IsNull(0, 2) ? 0 : result->GetInt64(0, 2);
 	// Read table-level comment from 14
@@ -199,15 +340,18 @@ unique_ptr<PostgresTableInfo> PostgresTableSet::GetTableInfo(PostgresTransaction
 
 unique_ptr<PostgresTableInfo> PostgresTableSet::GetTableInfo(ClientContext &context, PostgresConnection &connection,
                                                              const string &schema_name, const string &table_name) {
-	auto query = PostgresTableSet::GetInitializeQuery(schema_name, table_name);
+	auto query = PostgresUtils::UseInformationSchemaIntrospection(context)
+	                 ? GetInitializeQueryInformationSchema(schema_name, table_name)
+	                 : GetInitializeQuery(connection.GetPostgresVersion(context), schema_name, table_name);
 	auto result = connection.Query(context, query);
 	auto rows = result->Count();
 	if (rows == 0) {
 		throw InvalidInputException("Table %s does not contain any columns.", table_name);
 	}
 	auto table_info = make_uniq<PostgresTableInfo>(schema_name, table_name);
+	auto type_config = PostgresTypeConfig::FromContext(context);
 	for (idx_t row = 0; row < rows; row++) {
-		AddColumnOrConstraint(nullptr, nullptr, *result, row, *table_info);
+		AddColumnOrConstraint(nullptr, nullptr, type_config, *result, row, *table_info);
 	}
 	table_info->approx_num_pages = result->IsNull(0, 2) ? 0 : result->GetInt64(0, 2);
 	// Read table-level comment
@@ -223,7 +367,9 @@ optional_ptr<CatalogEntry> PostgresTableSet::ReloadEntry(PostgresTransaction &tr
 		return nullptr;
 	}
 	auto table_entry = make_shared_ptr<PostgresTableEntry>(catalog, schema, *table_info);
-	return CreateEntry(transaction, std::move(table_entry));
+	auto result = CreateEntry(transaction, std::move(table_entry));
+	RefreshStalenessSignature(transaction, /*use_transaction_connection=*/false);
+	return result;
 }
 
 // FIXME - this is almost entirely copied from TableCatalogEntry::ColumnsToSQL - should be unified
@@ -331,11 +477,11 @@ string GetPostgresCreateTable(CreateTableInfo &info) {
 	if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
 		ss << "IF NOT EXISTS ";
 	}
-	if (!info.schema.empty()) {
-		ss << PostgresUtils::WriteIdentifier(info.schema.GetIdentifierName());
+	if (!info.GetQualifiedName().Schema().empty()) {
+		ss << PostgresUtils::WriteIdentifier(info.GetQualifiedName().Schema().GetIdentifierName());
 		ss << ".";
 	}
-	ss << PostgresUtils::WriteIdentifier(info.table.GetIdentifierName());
+	ss << PostgresUtils::WriteIdentifier(info.GetTableName().GetIdentifierName());
 	ss << PostgresColumnsToSQL(info.columns, info.constraints);
 	ss << ";";
 	return ss.str();
@@ -345,7 +491,9 @@ optional_ptr<CatalogEntry> PostgresTableSet::CreateTable(PostgresTransaction &tr
 	auto create_sql = GetPostgresCreateTable(info.Base());
 	transaction.Query(create_sql);
 	auto tbl_entry = make_shared_ptr<PostgresTableEntry>(catalog, schema, info.Base());
-	return CreateEntry(transaction, std::move(tbl_entry));
+	auto result = CreateEntry(transaction, std::move(tbl_entry));
+	RefreshStalenessSignature(transaction, /*use_transaction_connection=*/true);
+	return result;
 }
 
 string PostgresTableSet::GetAlterTablePrefix(const string &name, optional_ptr<CatalogEntry> entry) {
@@ -375,15 +523,15 @@ string PostgresTableSet::GetAlterTablePrefix(ClientContext &context, PostgresTra
 }
 
 void PostgresTableSet::AlterTable(ClientContext &context, PostgresTransaction &transaction, RenameTableInfo &info) {
-	string sql = GetAlterTablePrefix(context, transaction, info.name.GetIdentifierName());
+	string sql = GetAlterTablePrefix(context, transaction, info.GetQualifiedName().Name().GetIdentifierName());
 	sql += " RENAME TO ";
 	sql += PostgresUtils::WriteIdentifier(info.new_table_name.GetIdentifierName());
 	transaction.Query(sql);
 }
 
 void PostgresTableSet::AlterTable(ClientContext &context, PostgresTransaction &transaction, RenameColumnInfo &info) {
-	auto entry = GetEntry(context, transaction, info.name.GetIdentifierName());
-	string sql = GetAlterTablePrefix(info.name.GetIdentifierName(), entry);
+	auto entry = GetEntry(context, transaction, info.GetQualifiedName().Name().GetIdentifierName());
+	string sql = GetAlterTablePrefix(info.GetQualifiedName().Name().GetIdentifierName(), entry);
 	sql += " RENAME COLUMN  ";
 	string column_name = GetAlterTableColumnName(info.old_name.GetIdentifierName(), entry);
 	sql += PostgresUtils::WriteIdentifier(column_name);
@@ -394,7 +542,7 @@ void PostgresTableSet::AlterTable(ClientContext &context, PostgresTransaction &t
 }
 
 void PostgresTableSet::AlterTable(ClientContext &context, PostgresTransaction &transaction, AddColumnInfo &info) {
-	string sql = GetAlterTablePrefix(context, transaction, info.name.GetIdentifierName());
+	string sql = GetAlterTablePrefix(context, transaction, info.GetQualifiedName().Name().GetIdentifierName());
 	sql += " ADD COLUMN  ";
 	if (info.if_column_not_exists) {
 		sql += "IF NOT EXISTS ";
@@ -410,7 +558,7 @@ void PostgresTableSet::AlterTable(ClientContext &context, PostgresTransaction &t
 			                      "only constant DEFAULT expressions are supported");
 		}
 		const ConstantExpression &default_const_expr = default_expr.Cast<ConstantExpression>();
-		std::string sql_str = default_const_expr.GetValue().ToSQLString();
+		std::string sql_str = default_const_expr.GetLiteral().ToValue().ToSQLString();
 		sql += " DEFAULT ";
 		sql += sql_str;
 	}
@@ -419,8 +567,8 @@ void PostgresTableSet::AlterTable(ClientContext &context, PostgresTransaction &t
 }
 
 void PostgresTableSet::AlterTable(ClientContext &context, PostgresTransaction &transaction, RemoveColumnInfo &info) {
-	auto entry = GetEntry(context, transaction, info.name.GetIdentifierName());
-	string sql = GetAlterTablePrefix(info.name.GetIdentifierName(), entry);
+	auto entry = GetEntry(context, transaction, info.GetQualifiedName().Name().GetIdentifierName());
+	string sql = GetAlterTablePrefix(info.GetQualifiedName().Name().GetIdentifierName(), entry);
 	sql += " DROP COLUMN  ";
 	if (info.if_column_exists) {
 		sql += "IF EXISTS ";

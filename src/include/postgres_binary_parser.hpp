@@ -9,6 +9,8 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/common/exception/conversion_exception.hpp"
+#include "duckdb/common/operator/add.hpp"
 #include "duckdb/common/types/interval.hpp"
 #include "postgres_conversion.hpp"
 #include "postgres_utils.hpp"
@@ -17,11 +19,18 @@ namespace duckdb {
 
 class PostgresBinaryParser {
 public:
-	PostgresBinaryParser(vector<LogicalType> types, vector<PostgresType> postgres_types);
+	PostgresBinaryParser(vector<LogicalType> types, vector<PostgresType> postgres_types,
+	                     PostgresTypeConfig type_config);
 
 	void SetBuffer(data_ptr_t buf, idx_t len);
+	//! Decode rows from the buffer into output until it is full or the buffer runs out;
+	//! returns true if output is full. Only the chunk's count is updated, not its vectors'
+	//! sizes: the caller must call output.SetChildCardinality(output.size()) once it is
+	//! done filling the chunk.
 	bool ReadChunk(DataChunk &output, const vector<column_t> &column_ids);
 	void CheckHeader();
+	void ParseValue(const LogicalType &type, const PostgresType &postgres_type, int32_t value_len, Vector &out_vec,
+	                idx_t output_offset);
 
 private:
 	bool Ready() {
@@ -38,6 +47,7 @@ private:
 
 	vector<LogicalType> types;
 	vector<PostgresType> postgres_types;
+	PostgresTypeConfig type_config;
 
 private:
 	template <class T>
@@ -58,10 +68,13 @@ private:
 		return val;
 	}
 
+	//! Defined out of line so the bounds checks that call it stay small enough to inline
+	[[noreturn]] static void ThrowOutOfBuffer(const char *function_name);
+
 	template <class T>
 	inline T ReadInteger() {
 		if (buffer_ptr + sizeof(T) > end) {
-			throw IOException("Postgres binary reader - out of buffer in ReadInteger");
+			ThrowOutOfBuffer("ReadInteger");
 		}
 		return ReadIntegerUnchecked<T>();
 	}
@@ -110,7 +123,16 @@ private:
 		if (usec == POSTGRES_NINFINITY) {
 			return timestamp_t::ninfinity();
 		}
-		return timestamp_t(usec + (POSTGRES_EPOCH_TS - DUCKDB_EPOCH_TS));
+		int64_t timestamp_usec;
+		if (!TryAddOperator::Operation(static_cast<int64_t>(usec),
+		                               static_cast<int64_t>(POSTGRES_EPOCH_TS - DUCKDB_EPOCH_TS), timestamp_usec)) {
+			throw ConversionException("timestamp out of range");
+		}
+		auto timestamp = timestamp_t(timestamp_usec);
+		if (!timestamp.IsFinite()) {
+			throw ConversionException("timestamp out of range");
+		}
+		return timestamp;
 	}
 
 	inline interval_t ReadInterval() {
@@ -131,7 +153,7 @@ private:
 
 	const char *ReadString(idx_t string_length) {
 		if (buffer_ptr + string_length > end) {
-			throw IOException("Postgres binary reader - out of buffer in ReadString");
+			ThrowOutOfBuffer("ReadString");
 		}
 		auto result = const_char_ptr_cast(buffer_ptr);
 		buffer_ptr += string_length;
@@ -139,15 +161,27 @@ private:
 	}
 
 	PostgresDecimalConfig ReadDecimalConfig();
+	PostgresDecimal<double> ReadDecimalAsDouble();
+
+	static PostgresDecimalKind NonFiniteDecimalKindFromSign(uint16_t dec_sign);
+
+	static string NonFiniteDecimalKindToString(PostgresDecimalKind kind);
 
 	template <class T, class OP = DecimalConversionInteger>
-	T ReadDecimal() {
+	PostgresDecimal<T> ReadDecimal() {
 		// this is wild
 		auto config = ReadDecimalConfig();
+
+		// we do not support non-finite numerics, need to return NULL or throw
+		if (config.sign == NUMERIC_NAN || config.sign == NUMERIC_PINF || config.sign == NUMERIC_NINF) {
+			PostgresDecimalKind kind = NonFiniteDecimalKindFromSign(config.sign);
+			return PostgresDecimal<T>(kind);
+		}
+
 		auto scale_POWER = OP::GetPowerOfTen(config.scale);
 
 		if (config.ndigits == 0) {
-			return 0;
+			return PostgresDecimal<T>(static_cast<T>(0));
 		}
 		T integral_part = 0, fractional_part = 0;
 
@@ -199,7 +233,8 @@ private:
 
 		// finally
 		auto base_res = OP::Finalize(config, integral_part + fractional_part);
-		return (config.is_negative ? -base_res : base_res);
+		auto val = (config.is_negative ? -base_res : base_res);
+		return PostgresDecimal<T>(val);
 	}
 
 	void ReadGeometry(const LogicalType &type, const PostgresType &postgres_type, Vector &out_vec, idx_t output_offset);
@@ -208,6 +243,8 @@ private:
 	               uint32_t current_count, uint32_t dimensions[], uint32_t ndim);
 
 	void ReadValue(const LogicalType &type, const PostgresType &postgres_type, Vector &out_vec, idx_t output_offset);
+
+	bool CheckDecimalKindSetNull(Vector &out_vec, idx_t output_offset, PostgresDecimalKind dec_kind);
 };
 
 } // namespace duckdb

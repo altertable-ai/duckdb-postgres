@@ -9,12 +9,12 @@
 #pragma once
 
 #include "duckdb.hpp"
-
-#include "dbconnector/bind_data.hpp"
+#include "duckdb/main/client_context.hpp"
 
 #include "postgres_utils.hpp"
 #include "postgres_connection.hpp"
 #include "postgres_parameters.hpp"
+#include "postgres_prepared_statement.hpp"
 #include "storage/postgres_connection_pool.hpp"
 
 namespace duckdb {
@@ -23,15 +23,25 @@ struct PostgresLocalState;
 struct PostgresGlobalState;
 class PostgresTransaction;
 
-struct PostgresBindData : public dbconnector::BindData {
+struct PostgresBindData : public FunctionData {
 	static constexpr const idx_t DEFAULT_PAGES_PER_TASK = 1000;
 
 public:
-	PostgresBindData(ClientContext &context);
+	PostgresBindData(ClientContext &context, const Identifier &catalog_name);
 
-	PostgresVersion version;
 	string schema_name;
 	string table_name;
+
+	Identifier catalog_name;
+	QualifiedName qualified_table_name;
+
+	PostgresQueryMode query_mode = PostgresQueryMode::AUTO;
+
+	// required for get_bind_info and only used there
+	weak_ptr<ClientContext> context_ptr;
+
+	//! Set by postgres_query, executed (without parameters) on the scan connection before the main query
+	vector<string> preliminary_queries;
 	string sql;
 	PostgresParameters params;
 	idx_t pages_approx = 0;
@@ -50,25 +60,28 @@ public:
 	bool emit_ctid = false;
 	bool use_transaction = true;
 	bool use_text_protocol = false;
+	//! Plain queries with binary results are used, but a scan falls back to the text protocol when it reads a column
+	//! that can only be read using the text protocol
+	bool text_protocol_fallback = false;
 	//! Set by postgres_query's bind when the statement returns no columns (a command like DDL, or
 	//! DML without RETURNING). InitGlobalState executes it and returns a single-row Success result.
 	bool command_only = false;
+	//! Set by postgres_query, clears the attached catalog cache after the query is executed
+	bool clear_catalog_cache = false;
 	idx_t max_threads = 1;
+	PostgresTypeConfig type_config;
+	//! The server the scan reads from - set in PrepareBind
+	PostgresInstanceType instance_type = PostgresInstanceType::POSTGRES;
 
-	dbconnector::optimizer::OrderByAndLimitBindData order_by_and_limit_bind_data;
-	dbconnector::optimizer::AggregateBindData aggregate_bind_data;
+	string limit_clause;
+
+	uint64_t pinned_connection_id = 0;
+
+	//! Statement prepared by postgres_query's bind to describe the query result
+	unique_ptr<PostgresPreparedStatement> prepared_statement;
 
 public:
 	void SetTablePages(idx_t approx_num_pages);
-
-	void SetCatalog(PostgresCatalog &catalog);
-	void SetTable(PostgresTableEntry &table);
-	optional_ptr<PostgresCatalog> GetCatalog() const {
-		return pg_catalog;
-	}
-	optional_ptr<PostgresTableEntry> GetTable() const {
-		return pg_table;
-	}
 
 	unique_ptr<FunctionData> Copy() const override {
 		throw NotImplementedException("");
@@ -76,23 +89,6 @@ public:
 	bool Equals(const FunctionData &other_p) const override {
 		return false;
 	}
-
-	dbconnector::optimizer::OrderByAndLimitBindData &GetOrderByAndLimitBindData() override {
-		return order_by_and_limit_bind_data;
-	}
-
-	dbconnector::optimizer::AggregateBindData &GetAggregateBindData() override {
-		return aggregate_bind_data;
-	}
-
-private:
-	optional_ptr<PostgresCatalog> pg_catalog;
-	optional_ptr<PostgresTableEntry> pg_table;
-};
-
-class PostgresAttachFunction : public TableFunction {
-public:
-	PostgresAttachFunction();
 };
 
 class PostgresScanFunction : public TableFunction {
@@ -100,12 +96,7 @@ public:
 	PostgresScanFunction();
 
 	static void PrepareBind(PostgresVersion version, ClientContext &context, PostgresBindData &bind,
-	                        int64_t approx_num_pages);
-};
-
-class PostgresScanFunctionFilterPushdown : public TableFunction {
-public:
-	PostgresScanFunctionFilterPushdown();
+	                        int64_t approx_num_pages, optional_ptr<PostgresCatalog> pg_catalog);
 };
 
 class PostgresClearCacheFunction : public TableFunction {
@@ -124,6 +115,16 @@ public:
 class PostgresExecuteFunction : public TableFunction {
 public:
 	PostgresExecuteFunction();
+};
+
+class PostgresPinConnectionFunction : public ScalarFunction {
+public:
+	PostgresPinConnectionFunction();
+};
+
+class PostgresClosePinnedConnectionFunction : public ScalarFunction {
+public:
+	PostgresClosePinnedConnectionFunction();
 };
 
 } // namespace duckdb
